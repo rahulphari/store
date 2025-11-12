@@ -1,197 +1,1070 @@
-<!doctype html>
-<html>
+<!DOCTYPE html>
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>StoreRoom - Hubli Budarshingi</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;max-width:900px;margin:18px auto;padding:12px}
-    h1{font-size:20px}
-    .card{border:1px solid #ddd;padding:10px;margin:8px 0;border-radius:6px}
-    label{display:block;margin:6px 0}
-    input,select,textarea{width:100%;padding:6px;margin-top:4px}
-    button{padding:8px 12px;margin-top:8px}
-    img.preview{max-width:120px;margin-top:6px;border-radius:6px}
-    pre{background:#f7f7f7;padding:10px;border-radius:6px}
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inventory Management</title>
+    <!-- 1. Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 2. Firebase SDK (ES Module) -->
+    <script type="module">
+        // Import Firebase services
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            onAuthStateChanged, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            signOut,
+            createUserWithEmailAndPassword,
+            signInWithEmailAndPassword
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            getDoc, 
+            setDoc, 
+            addDoc, 
+            updateDoc, 
+            deleteDoc, 
+            onSnapshot, 
+            collection, 
+            query, 
+            serverTimestamp,
+            runTransaction,
+            writeBatch,
+            getDocs
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+
+        // --- GLOBAL VARIABLES ---
+        let db, auth;
+        let currentUserId, currentUserRole;
+        let unsubscribeInventory = () => {};
+        let unsubscribeCart = () => {};
+        let unsubscribeOrders = () => {};
+        let unsubscribeUserRoles = () => {};
+
+        // --- USER'S FIREBASE CONFIG ---
+        // Using the config you provided for "hubli-store"
+        const firebaseConfig = {
+          apiKey: "AIzaSyDmCSYXnlcXfxt-MvoEkGs0ilVW-E2_Ex4",
+          authDomain: "hubli-store.firebaseapp.com",
+          projectId: "hubli-store",
+          storageBucket: "hubli-store.firebasestorage.app",
+          messagingSenderId: "324782981287",
+          appId: "1:324782981287:web:10f6b46d6a5f222a155b82",
+          measurementId: "G-FRFB45079Q"
+        };
+        
+        // This appId is used for the database paths and MUST match your security rules
+        const appId = firebaseConfig.projectId; // Using "hubli-store"
+        // --- END OF CONFIG ---
+
+
+        // --- DATABASE PATHS ---
+        // Public collection for all inventory items
+        const getInventoryCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'inventory');
+        // Public collection for user roles
+        const getUserRolesCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'user_roles');
+        // Public collection for all orders (for manager to see)
+        const getOrdersCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'orders');
+        // Private collection for a specific user's cart
+        const getUserCartCollection = (userId) => collection(db, 'artifacts', appId, 'users', userId, 'cart');
+
+        // --- 1. INITIALIZATION ---
+        async function initializeFirebase() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                setLogLevel('Debug'); // Enable verbose logging for Firestore
+                
+                setupAuthListener();
+            } catch (error) {
+                console.error("Firebase Init Error:", error);
+                showAuthError("Error connecting to services. Please refresh.");
+            }
+        }
+
+        // --- 2. AUTHENTICATION ---
+        function setupAuthListener() {
+            onAuthStateChanged(auth, async (user) => {
+                // Detach all old listeners
+                unsubscribeAll();
+
+                if (user) {
+                    currentUserId = user.uid;
+                    await checkUserRole(user); // Pass the full user object
+                    showView('app-container');
+                    document.getElementById('user-id-display').textContent = `User: ${user.email}`;
+                    document.getElementById('user-role-display').textContent = `Role: ${currentUserRole}`;
+                } else {
+                    currentUserId = null;
+                    currentUserRole = null;
+                    showView('login-view'); // User is logged out, show the login page
+                }
+            });
+        }
+
+        async function checkUserRole(user) {
+            const userId = user.uid;
+            const userEmail = user.email;
+            const userRoleRef = doc(getUserRolesCollection(), userId);
+            const userDoc = await getDoc(userRoleRef);
+
+            if (userDoc.exists()) {
+                currentUserRole = userDoc.data().role;
+            } else {
+                // New user, create a default 'user' role
+                currentUserRole = 'user';
+                await setDoc(userRoleRef, { 
+                    role: 'user', 
+                    created: serverTimestamp(),
+                    userId: userId, // Store userId for easier querying by managers
+                    email: userEmail  // Store user email
+                });
+            }
+            setupUIForRole(currentUserRole);
+            attachDataListeners(currentUserRole, userId);
+        }
+        
+        async function handleRegister() {
+            const email = document.getElementById('register-email').value;
+            const password = document.getElementById('register-password').value;
+            
+            if (!email || !password) {
+                showAuthError("Please enter both email and password.");
+                return;
+            }
+            
+            try {
+                showAuthLoading(true);
+                await createUserWithEmailAndPassword(auth, email, password);
+                // onAuthStateChanged will handle the rest (login, role check, UI switch)
+                showAuthLoading(false);
+                showAuthError(""); // Clear any old errors
+            } catch (error) {
+                console.error("Registration Error:", error);
+                showAuthError(getFriendlyAuthError(error));
+                showAuthLoading(false);
+            }
+        }
+
+        async function handleLogin() {
+            const email = document.getElementById('login-email').value;
+            const password = document.getElementById('login-password').value;
+            
+            if (!email || !password) {
+                showAuthError("Please enter both email and password.");
+                return;
+            }
+
+            try {
+                showAuthLoading(true);
+                await signInWithEmailAndPassword(auth, email, password);
+                // onAuthStateChanged will handle the rest
+                showAuthLoading(false);
+                showAuthError(""); // Clear any old errors
+            } catch (error) {
+                console.error("Login Error:", error);
+                showAuthError(getFriendlyAuthError(error));
+                showAuthLoading(false);
+            }
+        }
+
+        async function handleLogout() {
+            await signOut(auth);
+            // This will trigger onAuthStateChanged, which will clear state and show login view
+        }
+        
+        function getFriendlyAuthError(error) {
+            switch (error.code) {
+                case 'auth/invalid-email':
+                    return 'Please enter a valid email address.';
+                case 'auth/user-not-found':
+                case 'auth/wrong-password':
+                case 'auth/invalid-credential':
+                    return 'Invalid email or password.';
+                case 'auth/email-already-in-use':
+                    return 'This email is already registered. Please log in.';
+                case 'auth/weak-password':
+                    return 'Password should be at least 6 characters.';
+                default:
+                    return 'An error occurred. Please try again.';
+            }
+        }
+
+        // --- 3. UI & VIEW MANAGEMENT ---
+        function showView(viewId) {
+            // Hide all main views
+            ['loading-view', 'login-view', 'app-container'].forEach(id => {
+                document.getElementById(id).classList.add('hidden');
+            });
+            // Show the target view
+            document.getElementById(viewId).classList.remove('hidden');
+        }
+        
+        function toggleAuthForms(showRegister) {
+            const loginForm = document.getElementById('login-form');
+            const registerForm = document.getElementById('register-form');
+            if (showRegister) {
+                loginForm.classList.add('hidden');
+                registerForm.classList.remove('hidden');
+            } else {
+                loginForm.classList.remove('hidden');
+                registerForm.classList.add('hidden');
+            }
+            showAuthError(""); // Clear errors on toggle
+        }
+        
+        function showAuthError(message) {
+            const errorEl = document.getElementById('auth-error-message');
+            if (errorEl) {
+                errorEl.textContent = message;
+                errorEl.classList.toggle('hidden', !message);
+            }
+        }
+
+        function showAuthLoading(isLoading) {
+            document.getElementById('login-button').disabled = isLoading;
+            document.getElementById('register-button').disabled = isLoading;
+            document.getElementById('login-spinner').classList.toggle('hidden', !isLoading);
+            document.getElementById('register-spinner').classList.toggle('hidden', !isLoading);
+        }
+
+        function setupUIForRole(role) {
+            if (role === 'manager') {
+                document.getElementById('user-interface').classList.add('hidden');
+                document.getElementById('manager-interface').classList.remove('hidden');
+                showManagerTab('dashboard'); // Default manager tab
+            } else {
+                document.getElementById('user-interface').classList.remove('hidden');
+                document.getElementById('manager-interface').classList.add('hidden');
+                showUserPage('user-inventory-page'); // Default user page
+            }
+        }
+        
+        function showUserPage(pageId) {
+            // Hide all user pages
+            ['user-inventory-page', 'user-cart-page', 'user-checkout-page'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.classList.add('hidden');
+            });
+            // Show the target page
+            const targetEl = document.getElementById(pageId);
+            if (targetEl) targetEl.classList.remove('hidden');
+            
+            // Update nav button styles
+            document.querySelectorAll('#user-nav button').forEach(btn => {
+                if (btn.getAttribute('data-page') === pageId) {
+                    btn.classList.add('bg-blue-100', 'text-blue-700', 'shadow-inner');
+                    btn.classList.remove('text-gray-700', 'hover:bg-gray-100');
+                } else {
+                    btn.classList.remove('bg-blue-100', 'text-blue-700', 'shadow-inner');
+                    btn.classList.add('text-gray-700', 'hover:bg-gray-100');
+                }
+            });
+
+            if (pageId === 'user-checkout-page') {
+                renderCheckoutPage();
+            }
+        }
+
+        function showManagerTab(tabId) {
+            // Hide all manager tabs
+            ['dashboard-tab', 'inventory-mgt-tab', 'user-mgt-tab'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.classList.add('hidden');
+            });
+            // Deactivate all tab buttons
+            document.querySelectorAll('#manager-nav button').forEach(btn => {
+                btn.classList.replace('bg-blue-700', 'bg-gray-700');
+                btn.classList.add('hover:bg-blue-600');
+                btn.classList.remove('shadow-lg', 'ring-2', 'ring-blue-300');
+            });
+            // Show the target tab and activate its button
+            const activeBtn = document.querySelector(`button[onclick="showManagerTab('${tabId}')"]`);
+            if (activeBtn) {
+                activeBtn.classList.replace('bg-gray-700', 'bg-blue-700');
+                activeBtn.classList.remove('hover:bg-blue-600');
+                activeBtn.classList.add('shadow-lg', 'ring-2', 'ring-blue-300');
+            }
+            
+            const targetTab = document.getElementById(tabId + '-tab');
+            if (targetTab) targetTab.classList.remove('hidden');
+        }
+        
+        function showToast(message, isError = false) {
+            const toast = document.getElementById('toast-message');
+            if (!toast) return;
+            toast.textContent = message;
+            toast.classList.remove('hidden', 'opacity-0');
+            if (isError) {
+                toast.classList.add('bg-red-600');
+                toast.classList.remove('bg-green-600');
+            } else {
+                toast.classList.add('bg-green-600');
+                toast.classList.remove('bg-red-600');
+            }
+            // Fade out after 3 seconds
+            setTimeout(() => {
+                toast.classList.add('opacity-0');
+                setTimeout(() => toast.classList.add('hidden'), 500); // Wait for transition
+            }, 3000);
+        }
+
+        // --- 4. DATA LISTENERS ---
+        function attachDataListeners(role, userId) {
+            // 1. Listen to Inventory (all users)
+            const inventoryQuery = query(getInventoryCollection());
+            unsubscribeInventory = onSnapshot(inventoryQuery, (snapshot) => {
+                const inventory = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                // Sort data in memory
+                inventory.sort((a, b) => a.name.localeCompare(b.name));
+                
+                if (role === 'user') {
+                    renderUserInventory(inventory);
+                }
+                if (role === 'manager') {
+                    renderManagerInventory(inventory);
+                    renderDashboard(inventory);
+                }
+            }, (error) => console.error("Inventory listener error:", error));
+
+            // 2. Listen to User Cart (only for regular users)
+            if (role === 'user') {
+                const cartQuery = query(getUserCartCollection(userId));
+                unsubscribeCart = onSnapshot(cartQuery, (snapshot) => {
+                    const cart = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    localCartCache = cart; // Update local cache
+                    renderUserCart(cart);
+                }, (error) => console.error("Cart listener error:", error));
+            }
+
+            // 3. Listen to User Roles (only for managers)
+            if (role === 'manager') {
+                const usersQuery = query(getUserRolesCollection());
+                unsubscribeUserRoles = onSnapshot(usersQuery, (snapshot) => {
+                    const users = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    renderUserRoles(users);
+                }, (error) => console.error("User roles listener error:", error));
+            }
+            
+            // 4. Listen to Orders (only for managers)
+            // (Functionality not fully built out in UI, but listener is here)
+            // if (role === 'manager') {
+            //     const ordersQuery = query(getOrdersCollection(), orderBy('createdAt', 'desc'));
+            //     unsubscribeOrders = onSnapshot(ordersQuery, (snapshot) => {
+            //         const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            //         // renderOrders(orders); // <-- Function to build in dashboard
+            //     }, (error) => console.error("Orders listener error:", error));
+            // }
+        }
+
+        function unsubscribeAll() {
+            unsubscribeInventory();
+            unsubscribeCart();
+            unsubscribeOrders();
+            unsubscribeUserRoles();
+        }
+
+
+        // --- 5. REGULAR USER: ACTIONS & RENDERING ---
+        
+        // Cache for cart data to use on checkout page
+        let localCartCache = [];
+
+        // --- REGULAR USER: ACTIONS ---
+        async function handleAddToCart(itemId, itemName, maxStock) {
+            if (maxStock <= 0) {
+                showToast("Item is out of stock.", true);
+                return;
+            }
+            
+            const cartItemRef = doc(getUserCartCollection(currentUserId), itemId);
+            
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const cartItemDoc = await transaction.get(cartItemRef);
+                    
+                    if (cartItemDoc.exists()) {
+                        // Item already in cart, update quantity
+                        const newQuantity = cartItemDoc.data().quantity + 1;
+                        if (newQuantity > maxStock) {
+                            // We can't use showToast from in here, so we throw an error
+                            throw new Error("Cannot add more than available stock.");
+                        }
+                        transaction.update(cartItemRef, { quantity: newQuantity });
+                    } else {
+                        // New item, add to cart
+                        transaction.set(cartItemRef, {
+                            productId: itemId,
+                            productName: itemName,
+                            quantity: 1,
+                            addedAt: serverTimestamp()
+                        });
+                    }
+                });
+                showToast("Item added to cart!");
+            } catch (error) {
+                console.error("Add to cart error:", error.message);
+                showToast(error.message || "Could not add item to cart.", true);
+            }
+        }
+
+        async function handleUpdateCartQuantity(itemId, newQuantity) {
+            const cartItemRef = doc(getUserCartCollection(currentUserId), itemId);
+            if (newQuantity <= 0) {
+                // Remove item if quantity is 0 or less
+                await deleteDoc(cartItemRef);
+                showToast("Item removed from cart.");
+            } else {
+                // Check against max stock
+                const inventoryItemRef = doc(getInventoryCollection(), itemId);
+                const inventoryDoc = await getDoc(inventoryItemRef);
+                if (inventoryDoc.exists() && newQuantity > inventoryDoc.data().stock) {
+                    showToast("Cannot add more than available stock.", true);
+                } else {
+                    await updateDoc(cartItemRef, { quantity: newQuantity });
+                    showToast("Cart updated.");
+                }
+            }
+        }
+
+        async function handleRemoveFromCart(itemId) {
+            const cartItemRef = doc(getUserCartCollection(currentUserId), itemId);
+            await deleteDoc(cartItemRef);
+            showToast("Item removed from cart.");
+        }
+
+        async function handleSubmitOrder() {
+            const checkoutButton = document.getElementById('confirm-order-btn');
+            checkoutButton.disabled = true;
+            checkoutButton.textContent = "Submitting...";
+
+            const remarksInputs = document.querySelectorAll('.checkout-remarks-input');
+            const itemsWithRemarks = localCartCache.map(item => {
+                const input = document.getElementById(`remarks-${item.id}`);
+                return {
+                    ...item,
+                    remarks: input ? input.value : ""
+                };
+            });
+
+            if (itemsWithRemarks.length === 0) {
+                showToast("Your cart is empty.", true);
+                checkoutButton.disabled = false;
+                checkoutButton.textContent = "Confirm Order";
+                return;
+            }
+
+            try {
+                // Use a transaction to ensure stock is updated and order is created atomically
+                await runTransaction(db, async (transaction) => {
+                    const inventoryUpdates = [];
+                    
+                    // 1. Check stock for all items
+                    for (const item of itemsWithRemarks) {
+                        const inventoryRef = doc(getInventoryCollection(), item.productId);
+                        const inventoryDoc = await transaction.get(inventoryRef);
+                        
+                        if (!inventoryDoc.exists()) {
+                            throw new Error(`Item "${item.productName}" not found.`);
+                        }
+                        
+                        const currentStock = inventoryDoc.data().stock;
+                        if (currentStock < item.quantity) {
+                            throw new Error(`Not enough stock for "${item.productName}". Only ${currentStock} left.`);
+                        }
+                        
+                        // Prepare update
+                        const newStock = currentStock - item.quantity;
+                        transaction.update(inventoryRef, { stock: newStock });
+                    }
+                    
+                    // 2. Create the order
+                    const orderRef = doc(getOrdersCollection());
+                    transaction.set(orderRef, {
+                        userId: currentUserId,
+                        status: "pending",
+                        createdAt: serverTimestamp(),
+                        items: itemsWithRemarks
+                    });
+                });
+                
+                // 3. Clear the user's cart (outside the transaction, in a batch)
+                const batch = writeBatch(db);
+                localCartCache.forEach(item => {
+                    const cartItemRef = doc(getUserCartCollection(currentUserId), item.id);
+                    batch.delete(cartItemRef);
+                });
+                await batch.commit();
+
+                // 4. Success
+                showToast("Order submitted successfully!");
+                showUserPage('user-inventory-page'); // Go back to inventory
+                
+            } catch (error) {
+                console.error("Order submission error: ", error);
+                showToast(error.message || "Failed to submit order.", true);
+            } finally {
+                checkoutButton.disabled = false;
+                checkoutButton.textContent = "Confirm Order";
+            }
+        }
+
+        // --- REGULAR USER: RENDER ---
+        function renderUserInventory(inventory) {
+            const list = document.getElementById('user-inventory-list');
+            if (!list) return;
+            list.innerHTML = '';
+            if (inventory.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">No items in inventory.</p>';
+                return;
+            }
+
+            inventory.forEach(item => {
+                const inStock = item.stock > 0;
+                list.innerHTML += `
+                    <div class="bg-white p-4 rounded-xl shadow-lg flex justify-between items-center transition-all duration-300 hover:shadow-xl">
+                        <div>
+                            <h3 class="text-lg font-semibold text-gray-800">${item.name}</h3>
+                            <p class="text-gray-600">
+                                ${inStock ? `Stock: <span class="font-medium text-green-700">${item.stock}</span>` : '<span class="font-medium text-red-600">Out of Stock</span>'}
+                            </p>
+                        </div>
+                        <button 
+                            onclick="handleAddToCart('${item.id}', '${item.name}', ${item.stock})" 
+                            class="add-to-cart-btn ${inStock ? 'bg-blue-500 hover:bg-blue-600' : 'bg-gray-300 cursor-not-allowed'} text-white font-bold py-2 px-4 rounded-lg transition-all duration-200 shadow-md hover:shadow-lg transform hover:-translate-y-0.5"
+                            ${!inStock ? 'disabled' : ''}
+                        >
+                            Add to Cart
+                        </button>
+                    </div>
+                `;
+            });
+        }
+
+        function renderUserCart(cart) {
+            const list = document.getElementById('cart-items-list');
+            const totalSpan = document.getElementById('cart-total');
+            const checkoutBtn = document.getElementById('go-to-checkout-btn');
+            
+            if (!list || !totalSpan || !checkoutBtn) return;
+            
+            list.innerHTML = '';
+            let totalItems = 0;
+
+            if (cart.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">Your cart is empty.</p>';
+                checkoutBtn.disabled = true;
+                checkoutBtn.classList.add('bg-gray-300', 'cursor-not-allowed');
+                checkoutBtn.classList.remove('bg-green-500', 'hover:bg-green-600');
+            } else {
+                cart.forEach(item => {
+                    totalItems += item.quantity;
+                    list.innerHTML += `
+                        <div class="bg-white p-3 rounded-xl shadow-md flex justify-between items-center">
+                            <div>
+                                <h4 class="font-semibold text-gray-800">${item.productName}</h4>
+                                <div class="flex items-center gap-2 mt-2">
+                                    <button onclick="handleUpdateCartQuantity('${item.id}', ${item.quantity - 1})" class="bg-gray-200 w-7 h-7 rounded-full font-bold text-lg text-gray-700 flex items-center justify-center transition-all hover:bg-gray-300">-</button>
+                                    <span class="text-lg w-8 text-center">${item.quantity}</span>
+                                    <button onclick="handleUpdateCartQuantity('${item.id}', ${item.quantity + 1})" class="bg-gray-200 w-7 h-7 rounded-full font-bold text-lg text-gray-700 flex items-center justify-center transition-all hover:bg-gray-300">+</button>
+                                </div>
+                            </div>
+                            <button onclick="handleRemoveFromCart('${item.id}')" class="text-red-500 hover:text-red-700 font-medium transition-colors">
+                                Remove
+                            </button>
+                        </div>
+                    `;
+                });
+                checkoutBtn.disabled = false;
+                checkoutBtn.classList.remove('bg-gray-300', 'cursor-not-allowed');
+                checkoutBtn.classList.add('bg-green-500', 'hover:bg-green-600');
+            }
+            
+            totalSpan.textContent = `${totalItems} items`;
+        }
+        
+        function renderCheckoutPage() {
+            const list = document.getElementById('checkout-items-list');
+            list.innerHTML = '';
+            if (localCartCache.length === 0) {
+                 list.innerHTML = '<p class="text-gray-500">Your cart is empty. <a href="#" onclick="showUserPage(\'user-inventory-page\'); return false;" class="text-blue-500">Go shopping</a>.</p>';
+                 document.getElementById('confirm-order-btn').disabled = true;
+                 return;
+            }
+            
+            document.getElementById('confirm-order-btn').disabled = false;
+            localCartCache.forEach(item => {
+                list.innerHTML += `
+                    <div class="bg-white p-4 rounded-xl shadow-md">
+                        <h4 class="text-lg font-semibold text-gray-800">${item.productName} (Qty: ${item.quantity})</h4>
+                        <label for="remarks-${item.id}" class="block text-sm font-medium text-gray-700 mt-3">Remarks:</label>
+                        <input type="text" id="remarks-${item.id}" 
+                               data-cart-item-id="${item.id}" 
+                               class="checkout-remarks-input mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200 sm:text-sm" 
+                               placeholder="Optional remarks (e.g., condition, location)">
+                    </div>
+                `;
+            });
+        }
+
+
+        // --- 6. MANAGER: ACTIONS & RENDERING ---
+        
+        // --- MANAGER: RENDER ---
+        function renderDashboard(inventory) {
+            const totalSpan = document.getElementById('dashboard-summary-total');
+            const lowStockList = document.getElementById('low-stock-list');
+            if (!totalSpan || !lowStockList) return;
+
+            totalSpan.textContent = inventory.length;
+
+            const lowStockItems = inventory.filter(item => item.stock <= item.lowStockThreshold);
+            lowStockList.innerHTML = '';
+            
+            if (lowStockItems.length === 0) {
+                lowStockList.innerHTML = '<li class="text-gray-500">All items are well-stocked.</li>';
+                return;
+            }
+            
+            lowStockItems.forEach(item => {
+                lowStockList.innerHTML += `
+                    <li class="flex justify-between items-center p-3 bg-white rounded-xl shadow-md">
+                        <span class="font-medium text-gray-800">${item.name}</span>
+                        <span class="font-bold text-red-600">Stock: ${item.stock}</span>
+                    </li>
+                `;
+            });
+        }
+
+        function renderManagerInventory(inventory) {
+            const list = document.getElementById('manager-inventory-list');
+            if (!list) return;
+            list.innerHTML = '';
+            
+            if (inventory.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">No items in inventory yet.</p>';
+                return;
+            }
+
+            inventory.forEach(item => {
+                list.innerHTML += `
+                    <div class="bg-white p-4 rounded-xl shadow-lg grid grid-cols-1 md:grid-cols-4 gap-4 items-center">
+                        <div class="md:col-span-2">
+                            <h3 class="text-lg font-semibold text-gray-800">${item.name}</h3>
+                            <p class="text-sm text-gray-500">ID: ${item.id}</p>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <label for="stock-${item.id}" class="text-sm font-medium text-gray-700">Stock:</label>
+                            <input type="number" id="stock-${item.id}" value="${item.stock}" class="w-24 p-2 border border-gray-300 rounded-lg focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                        </div>
+                        <button onclick="handleUpdateStock('${item.id}')" class="bg-blue-500 text-white py-2 px-4 rounded-lg hover:bg-blue-600 font-semibold shadow-md transition-all duration-200 hover:shadow-lg transform hover:-translate-y-0.5">
+                            Update
+                        </button>
+                    </div>
+                `;
+            });
+        }
+        
+        function renderUserRoles(users) {
+            const list = document.getElementById('user-roles-list');
+            if (!list) return;
+            list.innerHTML = '';
+            
+            users.forEach(user => {
+                const isCurrentUser = user.id === currentUserId;
+                list.innerHTML += `
+                    <div class="bg-white p-4 rounded-xl shadow-lg flex flex-col md:flex-row justify-between md:items-center gap-4">
+                        <div class="mb-2 md:mb-0 flex-1">
+                            <p class-><span class="font-medium text-gray-800">Email:</span> ${user.email || 'N/A'}</p>
+                            <p class="text-sm text-gray-600 break-all"><span class="font-medium">User ID:</span> ${user.userId}</p>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <select id="role-${user.id}" class="p-2 border border-gray-300 rounded-lg focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200" ${isCurrentUser ? 'disabled' : ''}>
+                                <option value="user" ${user.role === 'user' ? 'selected' : ''}>Regular User</option>
+                                <option value="manager" ${user.role === 'manager' ? 'selected' : ''}>Manager</option>
+                            </select>
+                            <button onclick="handleUpdateUserRole('${user.id}')" 
+                                class="${isCurrentUser ? 'bg-gray-300 cursor-not-allowed' : 'bg-blue-500 hover:bg-blue-600'} text-white py-2 px-4 rounded-lg font-semibold shadow-md transition-all duration-200 hover:shadow-lg transform hover:-translate-y-0.5"
+                                ${isCurrentUser ? 'disabled' : ''}>
+                                Save
+                            </button>
+                        </div>
+                    </div>
+                `;
+            });
+        }
+        
+        // --- MANAGER: ACTIONS ---
+        async function handleAddInventoryItem() {
+            const name = document.getElementById('item-name').value.trim();
+            const stock = parseInt(document.getElementById('item-stock').value, 10);
+            const lowStock = parseInt(document.getElementById('item-low-stock').value, 10);
+            
+            if (!name || isNaN(stock) || isNaN(lowStock)) {
+                showToast("Please fill in all fields correctly.", true);
+                return;
+            }
+            
+            try {
+                await addDoc(getInventoryCollection(), {
+                    name: name,
+                    stock: stock,
+                    lowStockThreshold: lowStock,
+                    addedAt: serverTimestamp()
+                });
+                showToast("Item added to inventory.");
+                // Clear form
+                document.getElementById('item-name').value = '';
+                document.getElementById('item-stock').value = '10';
+                document.getElementById('item-low-stock').value = '5';
+            } catch (error) {
+                console.error("Add item error: ", error);
+                showToast("Failed to add item.", true);
+            }
+        }
+        
+        async function handleUpdateStock(itemId) {
+            const stockInput = document.getElementById(`stock-${itemId}`);
+            const newStock = parseInt(stockInput.value, 10);
+            
+            if (isNaN(newStock) || newStock < 0) {
+                showToast("Please enter a valid stock number.", true);
+                return;
+            }
+            
+            const itemRef = doc(getInventoryCollection(), itemId);
+            try {
+                await updateDoc(itemRef, { stock: newStock });
+                showToast("Stock updated successfully.");
+            } catch (error) {
+                console.error("Update stock error: ", error);
+                showToast("Failed to update stock.", true);
+            }
+        }
+        
+        async function handleUpdateUserRole(userId) {
+            if (userId === currentUserId) {
+                showToast("You cannot change your own role.", true);
+                return;
+            }
+            
+            const roleSelect = document.getElementById(`role-${userId}`);
+            const newRole = roleSelect.value;
+            
+            const userRoleRef = doc(getUserRolesCollection(), userId);
+            try {
+                await updateDoc(userRoleRef, { role: newRole });
+                showToast("User role updated successfully.");
+            } catch (error) {
+                console.error("Update role error: ", error);
+                showToast("Failed to update user role.", true);
+            }
+        }
+        
+        // --- 7. EVENT LISTENERS ---
+        function setupStaticEventListeners() {
+            // Logout button
+            document.querySelector('button[onclick="handleLogout()"]').addEventListener('click', handleLogout);
+            
+            // User Nav
+            document.querySelectorAll('#user-nav button').forEach(btn => {
+                btn.addEventListener('click', () => showUserPage(btn.dataset.page));
+            });
+            
+            // Go to Checkout Button
+            document.getElementById('go-to-checkout-btn').addEventListener('click', () => showUserPage('user-checkout-page'));
+
+            // Manager Nav
+            document.querySelectorAll('#manager-nav button').forEach(btn => {
+                const tab = btn.getAttribute('onclick').match(/'(.*?)'/)[1];
+                btn.addEventListener('click', () => showManagerTab(tab));
+            });
+            
+            // Manager Add Item
+            document.querySelector('button[onclick="handleAddInventoryItem()"]').addEventListener('click', handleAddInventoryItem);
+            
+            // Confirm Order
+            document.getElementById('confirm-order-btn').addEventListener('click', handleSubmitOrder);
+            
+            // --- NEW AUTH LISTENERS ---
+            document.getElementById('login-form').addEventListener('submit', (e) => {
+                e.preventDefault();
+                handleLogin();
+            });
+            document.getElementById('register-form').addEventListener('submit', (e) => {
+                e.preventDefault();
+                handleRegister();
+            });
+            document.getElementById('toggle-to-register').addEventListener('click', (e) => {
+                e.preventDefault();
+                toggleAuthForms(true);
+            });
+            document.getElementById('toggle-to-login').addEventListener('click', (e) => {
+                e.preventDefault();
+                toggleAuthForms(false);
+            });
+        }
+
+        // --- 8. GLOBAL EXPORTS & INITIALIZATION ---
+        // Expose functions needed by *dynamic* inline 'onclick' attributes
+        window.handleAddToCart = handleAddToCart;
+        window.handleUpdateCartQuantity = handleUpdateCartQuantity;
+        window.handleRemoveFromCart = handleRemoveFromCart;
+        window.handleUpdateStock = handleUpdateStock;
+        window.handleUpdateUserRole = handleUpdateUserRole;
+        window.handleLogout = handleLogout;
+        window.showUserPage = showUserPage;
+        window.showManagerTab = showManagerTab;
+
+        // Start the application
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeFirebase();
+            setupStaticEventListeners(); // Setup all static button clicks
+        });
+        
+    </script>
+
+    <!-- Custom Styles -->
+    <style>
+        /* Add a subtle fade-in for loaded views */
+        #app-container, #login-view {
+            animation: fadeIn 0.5s ease-in-out;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        
+        /* Simple spinner */
+        .spinner {
+            border: 2px solid rgba(0, 0, 0, 0.1);
+            border-left-color: #ffffff;
+            border-radius: 50%;
+            width: 16px;
+            height: 16px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
 </head>
-<body>
-  <h1>StoreRoom (Demo)</h1>
 
-  <div id="login" class="card">
-    <strong>Signed in as:</strong> <span id="userEmail">anonymous</span><br>
-    <small>Note: sign-in uses Google identity stored by browser (optional)</small>
-  </div>
+<body class="bg-gray-200">
 
-  <div id="items" class="card">
-    <strong>Items</strong>
-    <div id="itemList">Loading items…</div>
-  </div>
+    <!-- Loading View -->
+    <div id="loading-view" class="flex items-center justify-center min-h-screen">
+        <div class="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-blue-500"></div>
+    </div>
 
-  <div id="formCard" class="card" style="display:none">
-    <strong>New Withdrawal</strong>
-    <form id="withdrawForm">
-      <input type="hidden" id="item_id">
-      <label>Item: <span id="itemName"></span></label>
-      <label>Quantity (units): <input id="requested_units" type="number" min="1" required></label>
-      <label>Purpose type:
-        <select id="purpose_type"><option value="operations">Operations</option><option value="individual">Individual</option></select>
-      </label>
-      <label>Purpose detail: <input id="purpose_detail"></label>
-      <label>Security overseeing (name): <input id="security_overseeing"></label>
-      <label>Photo: <input id="photoInput" type="file" accept="image/*"></label>
-      <img id="photoPreview" class="preview" style="display:none">
-      <button type="button" onclick="submitWithdrawal()">Submit Request</button>
-    </form>
-    <div id="formOut"></div>
-  </div>
+    <!-- Login View (placeholder) -->
+    <div id="login-view" class="hidden flex items-center justify-center min-h-screen p-4">
+        <div class="w-full max-w-md">
+            <h1 class="text-4xl font-extrabold text-blue-800 text-center mb-6">InventoryPro</h1>
+            
+            <!-- Login Form -->
+            <form id="login-form" class="p-8 bg-white rounded-xl shadow-xl space-y-4">
+                <h2 class="text-2xl font-bold text-gray-800 text-center">Login</h2>
+                <div>
+                    <label for="login-email" class="block text-sm font-medium text-gray-700">Email</label>
+                    <input type="email" id="login-email" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                </div>
+                <div>
+                    <label for="login-password" class="block text-sm font-medium text-gray-700">Password</label>
+                    <input type="password" id="login-password" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                </div>
+                
+                <div id="auth-error-message" class="hidden text-sm text-red-600 font-medium"></div>
 
-  <div id="managerCard" class="card" style="display:none">
-    <strong>Manager — Pending Requests</strong>
-    <div id="pendingList">Loading…</div>
-  </div>
+                <button id="login-button" type="submit" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 transition-all duration-200 shadow-md flex items-center justify-center gap-2">
+                    <span id="login-spinner" class="spinner hidden"></span>
+                    Login
+                </button>
+                <p class="text-sm text-center text-gray-600">
+                    Don't have an account? 
+                    <a href="#" id="toggle-to-register" class="font-medium text-blue-600 hover:underline">Register here</a>
+                </p>
+            </form>
+            
+            <!-- Registration Form -->
+            <form id="register-form" class="hidden p-8 bg-white rounded-xl shadow-xl space-y-4">
+                <h2 class="text-2xl font-bold text-gray-800 text-center">Register</h2>
+                <div>
+                    <label for="register-email" class="block text-sm font-medium text-gray-700">Email</lebel>
+                    <input type="email" id="register-email" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                </div>
+                <div>
+                    <label for="register-password" class="block text-sm font-medium text-gray-700">Password (min. 6 characters)</lebel>
+                    <input type="password" id="register-password" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                </div>
+                
+                <!-- Auth error message will be shown by the login form's error div -->
 
-  <h3>Debug / logs</h3>
-  <pre id="log"></pre>
+                <button id="register-button" type="submit" class="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 transition-all duration-200 shadow-md flex items-center justify-center gap-2">
+                    <span id="register-spinner" class="spinner hidden"></span>
+                    Register
+                </button>
+                <p class="text-sm text-center text-gray-600">
+                    Already have an account? 
+                    <a href="#" id="toggle-to-login" class="font-medium text-blue-600 hover:underline">Login here</a>
+                </p>
+            </form>
+        </div>
+    </div>
 
-<script>
-const API_URL = 'https://script.google.com/a/macros/delhivery.com/s/AKfycbxqiL3Nnnm1JRjXYw5ANc3Ikk-oEfywL3Rm3kzSJPG73wcTiRADVUhzfoo5iKsn89us/exec';
-let itemsCache = [];
-let userEmail = 'anonymous@example.com';
+    <!-- Main App Container -->
+    <div id="app-container" class="hidden max-w-5xl mx-auto p-4 md:p-6">
+        <!-- Header -->
+        <header class="flex flex-col md:flex-row justify-between md:items-center mb-6 p-6 bg-white rounded-xl shadow-xl border-b-4 border-blue-700">
+            <h1 class="text-4xl font-extrabold text-blue-800">InventoryPro</h1>
+            <div class="mt-4 md:mt-0 text-left md:text-right">
+                <div class="text-sm text-gray-600 break-all">
+                    <span id="user-id-display"></span>
+                </div>
+                <div class="text-sm font-semibold text-blue-600">
+                    <span id="user-role-display"></span>
+                </div>
+                <button onclick="handleLogout()" class="mt-2 text-sm text-red-500 hover:underline">
+                    Logout
+                </button>
+            </div>
+        </header>
 
-// helper to call Apps Script
-async function apiCall(route, payload){
-  const body = { route: route, payload: payload || {} };
-  const res = await fetch(API_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  const json = await res.json();
-  appendLog('api:'+route+' -> '+JSON.stringify(json));
-  return json;
-}
+        <!-- ================================== -->
+        <!--      REGULAR USER INTERFACE      -->
+        <!-- ================================== -->
+        <main id="user-interface" class="hidden bg-gray-50 p-4 md:p-6 rounded-xl shadow-inner">
+            <!-- User Navigation -->
+            <nav id="user-nav" class="flex justify-around bg-white rounded-xl shadow-lg p-2 mb-6">
+                <button data-page="user-inventory-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg transition-all duration-200">
+                    Shop
+                </button>
+                <button data-page="user-cart-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg transition-all duration-200">
+                    Cart
+                </button>
+            </nav>
 
-function appendLog(msg){
-  document.getElementById('log').textContent = (new Date().toLocaleTimeString()) + ' ' + msg + '\n' + document.getElementById('log').textContent;
-}
+            <!-- User Page: Inventory -->
+            <div id="user-inventory-page">
+                <h2 class="text-2xl font-semibold mb-4">Products</h2>
+                <div id="user-inventory-list" class="space-y-4">
+                    <!-- JS will render inventory items here -->
+                </div>
+            </div>
 
-// init
-async function init(){
-  const r1 = await apiCall('getItems');
-  const r2 = await apiCall('getStock');
-  const items = r1.items || [];
-  const stock = r2.stock || [];
-  itemsCache = items.map(it=>{
-    const st = stock.find(s=>s.item_id===it.id) || { total_units:0, reserved_units:0 };
-    it.available = (st.total_units || 0) - (st.reserved_units || 0);
-    it.total_units = st.total_units || 0;
-    return it;
-  });
-  renderItems();
-  loadPending();
-}
+            <!-- User Page: Cart -->
+            <div id="user-cart-page" class="hidden">
+                <h2 class="text-2xl font-semibold mb-4">Your Cart</h2>
+                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                    <div id="cart-items-list" class="space-y-4 mb-5">
+                        <!-- JS will render cart items here -->
+                    </div>
+                    <hr class="my-4">
+                    <div class="flex justify-between items-center mb-5">
+                        <span class="text-lg font-medium text-gray-800">Total:</span>
+                        <span id="cart-total" class="text-lg font-bold text-gray-900">0 items</span>
+                    </div>
+                    <button id="go-to-checkout-btn" class="w-full bg-green-500 text-white font-semibold py-3 px-4 rounded-lg hover:bg-green-600 transition-all duration-200 shadow-md hover:shadow-lg transform hover:-translate-y-0.5">
+                        Proceed to Checkout
+                    </button>
+                </div>
+            </div>
+            
+            <!-- User Page: Checkout -->
+            <div id="user-checkout-page" class="hidden">
+                <h2 class="text-2xl font-semibold mb-4">Checkout</h2>
+                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                    <h3 class="text-xl font-semibold mb-4">Order Summary & Remarks</h3>
+                    <p class="text-sm text-gray-600 mb-5">Please add any required remarks for each item before confirming.</p>
+                    <div id="checkout-items-list" class="space-y-4 mb-6">
+                        <!-- JS will render cart items with remark inputs here -->
+                    </div>
+                    <button id="confirm-order-btn" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 transition-all duration-200 shadow-md hover:shadow-lg transform hover:-translate-y-0.5">
+                        Confirm Order
+                    </button>
+                </div>
+            </div>
+        </main>
 
-function renderItems(){
-  const el = document.getElementById('itemList');
-  el.innerHTML = '';
-  itemsCache.forEach(it=>{
-    const div = document.createElement('div');
-    div.className = 'card';
-    div.innerHTML = '<strong>'+escapeHtml(it.name)+'</strong> <br> SKU: '+escapeHtml(it.sku||'') +
-      '<br>Available: '+it.available+' '+ (it.uom||'') +
-      '<br><button onclick="openRequest(\\''+it.id+'\\')">Request withdrawal</button>';
-    el.appendChild(div);
-  });
-}
+        <!-- ================================== -->
+        <!--        MANAGER INTERFACE         -->
+        <!-- ================================== -->
+        <main id="manager-interface" class="hidden bg-gray-50 p-4 md:p-6 rounded-xl shadow-inner">
+            <!-- Manager Navigation -->
+            <nav id="manager-nav" class="flex flex-wrap justify-center bg-gray-800 rounded-xl shadow-lg p-2 mb-6 gap-2">
+                <button onclick="showManagerTab('dashboard')" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-blue-700 hover:bg-blue-600 rounded-lg transition-all duration-200">
+                    Dashboard
+                </button>
+                <button onclick="showManagerTab('inventory-mgt')" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg transition-all duration-200">
+                    Inventory Mgt
+                </button>
+                <button onclick="showManagerTab('user-mgt')" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg transition-all duration-200">
+                    User Mgt
+                </in>
+            </nav>
 
-function openRequest(itemId){
-  const it = itemsCache.find(i=>i.id===itemId);
-  if(!it) return;
-  document.getElementById('formCard').style.display='block';
-  document.getElementById('item_id').value = it.id;
-  document.getElementById('itemName').textContent = it.name + ' (Available: '+it.available+')';
-  document.getElementById('requested_units').value = 1;
-  window.scrollTo(0, document.getElementById('formCard').offsetTop);
-}
+            <!-- Manager Tab: Dashboard -->
+            <div id="dashboard-tab">
+                <h2 class="text-2xl font-semibold mb-4">Manager Dashboard</h2>
+                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                    <h3 class="text-xl font-semibold mb-2 text-gray-800">Inventory Summary</h3>
+                    <p class="text-gray-700">Total unique items: <span id="dashboard-summary-total" class="font-bold text-blue-600 text-lg">0</span></p>
+                    
+                    <h3 class="text-xl font-semibold mt-6 mb-4 text-red-600">Low Stock Alert</h3>
+                    <ul id="low-stock-list" class="space-y-3">
+                        <!-- JS will render low stock items here -->
+                    </ul>
+                </div>
+            </div>
 
-document.getElementById('photoInput').addEventListener('change', function(e){
-  const f = e.target.files[0];
-  if(!f) return;
-  const reader = new FileReader();
-  reader.onload = function(ev){
-    const base64 = ev.target.result.split(',')[1];
-    document.getElementById('photoPreview').src = ev.target.result;
-    document.getElementById('photoPreview').style.display = 'block';
-    document.getElementById('photoPreview').dataset.base64 = base64;
-    document.getElementById('photoPreview').dataset.name = f.name;
-    document.getElementById('photoPreview').dataset.type = f.type;
-  };
-  reader.readAsDataURL(f);
-});
-
-async function submitWithdrawal(){
-  const payload = {
-    requestor_email: userEmail,
-    item_id: document.getElementById('item_id').value,
-    requested_units: Number(document.getElementById('requested_units').value),
-    purpose_type: document.getElementById('purpose_type').value,
-    purpose_detail: document.getElementById('purpose_detail').value,
-    security_overseeing: document.getElementById('security_overseeing').value,
-    photos: []
-  };
-  // upload photo if provided
-  const preview = document.getElementById('photoPreview');
-  if(preview && preview.dataset && preview.dataset.base64){
-    const upRes = await apiCall('uploadPhoto', { fileName: preview.dataset.name, mimeType: preview.dataset.type, base64: preview.dataset.base64 });
-    if(upRes && upRes.success) payload.photos.push({ fileId: upRes.fileId, url: upRes.url });
-    else { appendLog('photo upload failed'); }
-  }
-
-  const res = await apiCall('createWithdrawal', payload);
-  if(res && res.success){
-    document.getElementById('formOut').textContent = 'Request created: ' + res.withdrawal_id;
-    init();
-  } else {
-    document.getElementById('formOut').textContent = 'Error: ' + (res.message || JSON.stringify(res));
-  }
-}
-
-// Manager: load pending requests (requires apps script getPending route)
-async function loadPending(){
-  const _res = await apiCall('getPending', {});
-  if(_res && _res.success){
-    const container = document.getElementById('pendingList');
-    container.innerHTML = '';
-    _res.pending.forEach(p=>{
-      const d = document.createElement('div');
-      d.className='card';
-      d.innerHTML = '<strong>ID:</strong> '+p.id+' <br> <strong>Item:</strong> '+p.item_id+' <br> <strong>Qty:</strong> '+p.requested_units +
-                    '<br><button onclick="approve(\\''+p.id+'\\')">Approve</button> <button onclick="reject(\\''+p.id+'\\')">Reject</button>';
-      container.appendChild(d);
-    });
-  } else {
-    document.getElementById('pendingList').innerText = JSON.stringify(_res);
-  }
-}
-
-async function approve(id){
-  const res = await apiCall('verifyWithdrawal', { withdrawal_id: id, action: 'approve', manager_email: userEmail });
-  appendLog('approve -> '+JSON.stringify(res));
-  loadPending();
-  init();
-}
-async function reject(id){
-  const res = await apiCall('verifyWithdrawal', { withdrawal_id: id, action: 'reject', manager_email: userEmail });
-  appendLog('reject -> '+JSON.stringify(res));
-  loadPending();
-  init();
-}
-
-function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'})[m];}); }
-
-init();
-</script>
+            <!-- Manager Tab: Inventory Management -->
+            <div id="inventory-mgt-tab" class="hidden">
+                <h2 class="text-2xl font-semibold mb-4">Inventory Management</h2>
+                <!-- Add New Item Form -->
+                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl mb-6">
+                    <h3 class="text-xl font-semibold mb-4 text-gray-800">Add New Item</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <input type="text" id="item-name" placeholder="Item Name" class="col-span-1 md:col-span-2 p-3 border rounded-lg border-gray-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                        <input type="number" id="item-stock" placeholder="Initial Stock" value="10" class="p-3 border rounded-lg border-gray-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+                        <input type="number" id="item-low-stock" placeholder="Low Stock Threshold" value="5" class="p-3 border rounded-lg border-gray-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                        <button onclick="handleAddInventoryItem()" class="col-span-1 md:col-span-2 bg-green-500 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-600 transition-all duration-200 shadow-md hover:shadow-lg transform hover:-translate-y-0.5">
+                            Add Item
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Manage Existing Items -->
+                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                    <h3 class="text-xl font-semibold mb-4 text-gray-800">Manage Stock</h3>
+                    <div id="manager-inventory-list" class="space-y-4">
+                        <!-- JS will render full inventory list for managers here -->
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Manager Tab: User Management -->
+            <div id="user-mgt-tab" class="hidden">
+                <h2 class="text-2xl font-semibold mb-4">User Role Management</h2>
+                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                    <div id="user-roles-list" class="space-y-4">
+                        <!-- JS will render user roles here -->
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <!-- Toast Notification -->
+    <div id="toast-message" class="hidden opacity-0 fixed top-5 right-5 z-50 bg-green-600 text-white py-3 px-6 rounded-lg shadow-xl transition-all duration-500">
+        <!-- Message set by JS -->
+    </div>
 
 </body>
 </html>
