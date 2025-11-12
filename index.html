@@ -1,0 +1,197 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>StoreRoom - Hubli Budarshingi</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;max-width:900px;margin:18px auto;padding:12px}
+    h1{font-size:20px}
+    .card{border:1px solid #ddd;padding:10px;margin:8px 0;border-radius:6px}
+    label{display:block;margin:6px 0}
+    input,select,textarea{width:100%;padding:6px;margin-top:4px}
+    button{padding:8px 12px;margin-top:8px}
+    img.preview{max-width:120px;margin-top:6px;border-radius:6px}
+    pre{background:#f7f7f7;padding:10px;border-radius:6px}
+  </style>
+</head>
+<body>
+  <h1>StoreRoom (Demo)</h1>
+
+  <div id="login" class="card">
+    <strong>Signed in as:</strong> <span id="userEmail">anonymous</span><br>
+    <small>Note: sign-in uses Google identity stored by browser (optional)</small>
+  </div>
+
+  <div id="items" class="card">
+    <strong>Items</strong>
+    <div id="itemList">Loading items…</div>
+  </div>
+
+  <div id="formCard" class="card" style="display:none">
+    <strong>New Withdrawal</strong>
+    <form id="withdrawForm">
+      <input type="hidden" id="item_id">
+      <label>Item: <span id="itemName"></span></label>
+      <label>Quantity (units): <input id="requested_units" type="number" min="1" required></label>
+      <label>Purpose type:
+        <select id="purpose_type"><option value="operations">Operations</option><option value="individual">Individual</option></select>
+      </label>
+      <label>Purpose detail: <input id="purpose_detail"></label>
+      <label>Security overseeing (name): <input id="security_overseeing"></label>
+      <label>Photo: <input id="photoInput" type="file" accept="image/*"></label>
+      <img id="photoPreview" class="preview" style="display:none">
+      <button type="button" onclick="submitWithdrawal()">Submit Request</button>
+    </form>
+    <div id="formOut"></div>
+  </div>
+
+  <div id="managerCard" class="card" style="display:none">
+    <strong>Manager — Pending Requests</strong>
+    <div id="pendingList">Loading…</div>
+  </div>
+
+  <h3>Debug / logs</h3>
+  <pre id="log"></pre>
+
+<script>
+const API_URL = 'https://script.google.com/a/macros/delhivery.com/s/AKfycbxqiL3Nnnm1JRjXYw5ANc3Ikk-oEfywL3Rm3kzSJPG73wcTiRADVUhzfoo5iKsn89us/exec';
+let itemsCache = [];
+let userEmail = 'anonymous@example.com';
+
+// helper to call Apps Script
+async function apiCall(route, payload){
+  const body = { route: route, payload: payload || {} };
+  const res = await fetch(API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const json = await res.json();
+  appendLog('api:'+route+' -> '+JSON.stringify(json));
+  return json;
+}
+
+function appendLog(msg){
+  document.getElementById('log').textContent = (new Date().toLocaleTimeString()) + ' ' + msg + '\n' + document.getElementById('log').textContent;
+}
+
+// init
+async function init(){
+  const r1 = await apiCall('getItems');
+  const r2 = await apiCall('getStock');
+  const items = r1.items || [];
+  const stock = r2.stock || [];
+  itemsCache = items.map(it=>{
+    const st = stock.find(s=>s.item_id===it.id) || { total_units:0, reserved_units:0 };
+    it.available = (st.total_units || 0) - (st.reserved_units || 0);
+    it.total_units = st.total_units || 0;
+    return it;
+  });
+  renderItems();
+  loadPending();
+}
+
+function renderItems(){
+  const el = document.getElementById('itemList');
+  el.innerHTML = '';
+  itemsCache.forEach(it=>{
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.innerHTML = '<strong>'+escapeHtml(it.name)+'</strong> <br> SKU: '+escapeHtml(it.sku||'') +
+      '<br>Available: '+it.available+' '+ (it.uom||'') +
+      '<br><button onclick="openRequest(\\''+it.id+'\\')">Request withdrawal</button>';
+    el.appendChild(div);
+  });
+}
+
+function openRequest(itemId){
+  const it = itemsCache.find(i=>i.id===itemId);
+  if(!it) return;
+  document.getElementById('formCard').style.display='block';
+  document.getElementById('item_id').value = it.id;
+  document.getElementById('itemName').textContent = it.name + ' (Available: '+it.available+')';
+  document.getElementById('requested_units').value = 1;
+  window.scrollTo(0, document.getElementById('formCard').offsetTop);
+}
+
+document.getElementById('photoInput').addEventListener('change', function(e){
+  const f = e.target.files[0];
+  if(!f) return;
+  const reader = new FileReader();
+  reader.onload = function(ev){
+    const base64 = ev.target.result.split(',')[1];
+    document.getElementById('photoPreview').src = ev.target.result;
+    document.getElementById('photoPreview').style.display = 'block';
+    document.getElementById('photoPreview').dataset.base64 = base64;
+    document.getElementById('photoPreview').dataset.name = f.name;
+    document.getElementById('photoPreview').dataset.type = f.type;
+  };
+  reader.readAsDataURL(f);
+});
+
+async function submitWithdrawal(){
+  const payload = {
+    requestor_email: userEmail,
+    item_id: document.getElementById('item_id').value,
+    requested_units: Number(document.getElementById('requested_units').value),
+    purpose_type: document.getElementById('purpose_type').value,
+    purpose_detail: document.getElementById('purpose_detail').value,
+    security_overseeing: document.getElementById('security_overseeing').value,
+    photos: []
+  };
+  // upload photo if provided
+  const preview = document.getElementById('photoPreview');
+  if(preview && preview.dataset && preview.dataset.base64){
+    const upRes = await apiCall('uploadPhoto', { fileName: preview.dataset.name, mimeType: preview.dataset.type, base64: preview.dataset.base64 });
+    if(upRes && upRes.success) payload.photos.push({ fileId: upRes.fileId, url: upRes.url });
+    else { appendLog('photo upload failed'); }
+  }
+
+  const res = await apiCall('createWithdrawal', payload);
+  if(res && res.success){
+    document.getElementById('formOut').textContent = 'Request created: ' + res.withdrawal_id;
+    init();
+  } else {
+    document.getElementById('formOut').textContent = 'Error: ' + (res.message || JSON.stringify(res));
+  }
+}
+
+// Manager: load pending requests (requires apps script getPending route)
+async function loadPending(){
+  const _res = await apiCall('getPending', {});
+  if(_res && _res.success){
+    const container = document.getElementById('pendingList');
+    container.innerHTML = '';
+    _res.pending.forEach(p=>{
+      const d = document.createElement('div');
+      d.className='card';
+      d.innerHTML = '<strong>ID:</strong> '+p.id+' <br> <strong>Item:</strong> '+p.item_id+' <br> <strong>Qty:</strong> '+p.requested_units +
+                    '<br><button onclick="approve(\\''+p.id+'\\')">Approve</button> <button onclick="reject(\\''+p.id+'\\')">Reject</button>';
+      container.appendChild(d);
+    });
+  } else {
+    document.getElementById('pendingList').innerText = JSON.stringify(_res);
+  }
+}
+
+async function approve(id){
+  const res = await apiCall('verifyWithdrawal', { withdrawal_id: id, action: 'approve', manager_email: userEmail });
+  appendLog('approve -> '+JSON.stringify(res));
+  loadPending();
+  init();
+}
+async function reject(id){
+  const res = await apiCall('verifyWithdrawal', { withdrawal_id: id, action: 'reject', manager_email: userEmail });
+  appendLog('reject -> '+JSON.stringify(res));
+  loadPending();
+  init();
+}
+
+function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'})[m];}); }
+
+init();
+</script>
+
+</body>
+</html>
