@@ -120,16 +120,36 @@
             }
         }
         
-        // --- NEW PUBLIC LISTENER ---
+        // --- UPDATED PUBLIC LISTENER (WITH FILTERS) ---
         function setupPublicInventoryListener() {
+            // --- NEW: Attach listeners here ---
+            const categoryFilter = document.getElementById('public-category-filter');
+            const searchFilter = document.getElementById('public-search-filter');
+            
+            let publicInventoryCache = []; // Cache for public view
+            
+            const reRenderPublic = () => {
+                if(publicInventoryCache.length > 0) {
+                    renderPublicInventory(publicInventoryCache);
+                }
+            };
+            
+            if (categoryFilter) {
+                categoryFilter.addEventListener('input', reRenderPublic);
+            }
+            if (searchFilter) {
+                searchFilter.addEventListener('input', reRenderPublic);
+            }
+            // --- End of new listener attachment ---
+            
             const inventoryQuery = query(getInventoryCollection(), orderBy('name'));
             unsubscribePublicInventory = onSnapshot(inventoryQuery, (snapshot) => {
-                const publicInventory = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                renderPublicInventory(publicInventory);
+                publicInventoryCache = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })); // Update cache
+                renderPublicInventory(publicInventoryCache); // Initial render
                 
                 // Find the most recent update time
                 let lastUpdate = null;
-                publicInventory.forEach(item => {
+                publicInventoryCache.forEach(item => {
                     const addTime = item.lastAddition?.date?.toDate();
                     const withdrawTime = item.lastWithdrawal?.date?.toDate();
                     if (addTime && (!lastUpdate || addTime > lastUpdate)) lastUpdate = addTime;
@@ -848,25 +868,36 @@
 
         // --- REGULAR USER: RENDER ---
         
-        // --- NEW PUBLIC INVENTORY RENDER (WITH CATEGORIES & HIDING) ---
+        // --- UPDATED PUBLIC INVENTORY RENDER (Search Only, Simple Scroll) ---
         function renderPublicInventory(inventory) {
             const list = document.getElementById('public-inventory-list');
             const errorEl = document.getElementById('public-inventory-error');
             if (!list || !errorEl) return;
             
+            // --- START UPDATED FILTER LOGIC (Search Only) ---
+            const searchFilterEl = document.getElementById('public-search-filter');
+            const searchTerm = searchFilterEl ? searchFilterEl.value.toLowerCase() : '';
+
+            // --- NEW: Filter out hidden items ---
+            const visibleInventory = inventory.filter(item => !item.isHidden);
+
+            // Now, filter the visible items
+            const filteredAndVisibleInventory = visibleInventory.filter(item => {
+                const searchMatch = item.name.toLowerCase().includes(searchTerm) || (item.itemCode || '').toLowerCase().includes(searchTerm);
+                return searchMatch;
+            });
+            // --- END UPDATED FILTER LOGIC ---
+            
             list.innerHTML = ''; // Clear previous
             errorEl.classList.add('hidden');
             
-            // --- NEW: Filter out hidden items ---
-            const visibleInventory = inventory.filter(item => !item.isHidden);
-            
-            if (visibleInventory.length === 0) {
-                list.innerHTML = '<p class="text-gray-500">No items in inventory.</p>';
+            if (filteredAndVisibleInventory.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">No items match your search.</p>';
                 return;
             }
             
-            // --- NEW: Group by category ---
-            const categories = visibleInventory.reduce((acc, item) => {
+            // --- Group by category ---
+            const categoryGroups = filteredAndVisibleInventory.reduce((acc, item) => {
                 const category = item.category || 'Uncategorized';
                 if (!acc[category]) {
                     acc[category] = [];
@@ -876,12 +907,12 @@
             }, {});
 
             // 2. Get sorted category names
-            const sortedCategories = Object.keys(categories).sort();
+            const sortedCategories = Object.keys(categoryGroups).sort();
             let html = '';
 
             // 3. Render by category
             for (const categoryName of sortedCategories) {
-                const items = categories[categoryName];
+                const items = categoryGroups[categoryName];
                 
                 // Add category header
                 html += `<h3 class="text-2xl font-bold text-gray-700 mt-6 mb-3 border-b-2 border-gray-200 pb-2">${categoryName}</h3>`;
@@ -924,6 +955,7 @@
                 });
             } // End category loop
             
+            // --- NEW: Simplified render ---
             list.innerHTML = html;
         }
         
@@ -975,7 +1007,7 @@
             document.getElementById('update-profile-btn').onclick = () => handleProfileUpdate(isFirstTime);
         }
         
-        // --- NEW: RENDER USER INVENTORY WITH FILTERS ---
+        // --- UPDATED: RENDER USER INVENTORY WITH FILTERS ---
         function renderUserInventory(inventory) {
             const list = document.getElementById('user-inventory-list');
             if (!list) return;
@@ -984,7 +1016,9 @@
             const categoryFilterEl = document.getElementById('user-category-filter');
             const searchFilterEl = document.getElementById('user-search-filter');
             
-            const selectedCategory = categoryFilterEl ? categoryFilterEl.value : 'ALL';
+            // --- FIX: Correctly default to "ALL" ---
+            const currentCategoryValue = categoryFilterEl ? categoryFilterEl.value : 'ALL';
+            const selectedCategory = currentCategoryValue || 'ALL'; // Default to 'ALL' if ""
             const searchTerm = searchFilterEl ? searchFilterEl.value.toLowerCase() : '';
 
             // Populate Category Filter (only from visible items)
@@ -992,14 +1026,14 @@
             const categories = ['ALL', ...new Set(allVisibleItems.map(item => item.category || 'Uncategorized'))];
             
             if (categoryFilterEl) {
-                const currentVal = categoryFilterEl.value; // Save current value
+                // --- FIX: Cleaned up dropdown population logic ---
                 // Check if options are different before re-rendering to avoid flicker/losing focus
                 if (categoryFilterEl.options.length !== categories.length) {
                      categoryFilterEl.innerHTML = categories.sort().map(cat => 
-                        `<option value="${cat}" ${cat === currentVal ? 'selected' : ''}>${cat}</option>`
+                        `<option value="${cat}">${cat}</option>`
                      ).join('');
                 }
-                // Ensure the value is set correctly even if options didn't change
+                // Always set the value *after* populating, defaulting to "ALL"
                 categoryFilterEl.value = selectedCategory;
             }
 
@@ -1326,7 +1360,7 @@
             });
         }
 
-        // --- NEW: RENDER MANAGER INVENTORY WITH FILTERS ---
+        // --- UPDATED: RENDER MANAGER INVENTORY WITH FILTERS ---
         function renderManagerInventory(inventory) {
             const list = document.getElementById('manager-inventory-list');
             if (!list) return;
@@ -1335,21 +1369,21 @@
             const categoryFilterEl = document.getElementById('manager-category-filter');
             const searchFilterEl = document.getElementById('manager-search-filter');
             
-            const selectedCategory = categoryFilterEl ? categoryFilterEl.value : 'ALL';
+            const currentCategoryValue = categoryFilterEl ? categoryFilterEl.value : 'ALL';
+            const selectedCategory = currentCategoryValue || 'ALL'; // Default to 'ALL' if ""
             const searchTerm = searchFilterEl ? searchFilterEl.value.toLowerCase() : '';
 
             // Populate Category Filter (from ALL items, hidden or not)
             const categories = ['ALL', ...new Set(inventory.map(item => item.category || 'Uncategorized'))];
             
             if (categoryFilterEl) {
-                const currentVal = categoryFilterEl.value;
                 if (categoryFilterEl.options.length !== categories.length) {
                      categoryFilterEl.innerHTML = categories.sort().map(cat => 
-                        `<option value="${cat}" ${cat === currentVal ? 'selected' : ''}>${cat}</option>`
+                        `<option value="${cat}">${cat}</option>`
                      ).join('');
-                } else {
-                     categoryFilterEl.value = selectedCategory;
                 }
+                 // Always set the value *after* populating, defaulting to "ALL"
+                categoryFilterEl.value = selectedCategory;
             }
 
             // Filter the inventory
@@ -2217,6 +2251,9 @@
             // --- NEW: Filter Listeners ---
             // Use 'input' for live search
             // --- FIX: Add guards to prevent errors if elements don't exist ---
+            
+            // Public page filters are handled in setupPublicInventoryListener
+            
             const userCategoryFilter = document.getElementById('user-category-filter');
             if (userCategoryFilter) {
                 userCategoryFilter.addEventListener('input', () => renderUserInventory(inventoryCache));
@@ -2303,6 +2340,32 @@
         body {
             font-family: Arial, sans-serif;
         }
+        
+        /* NEW: Marquee Scroll Animation */
+        .marquee-container {
+            height: 600px; /* Fixed height for the viewport */
+            overflow-y: hidden;
+            position: relative;
+            /* Add a soft fade at the top and bottom */
+            -webkit-mask-image: linear-gradient(to bottom, transparent, black 10%, black 90%, transparent);
+            mask-image: linear-gradient(to bottom, transparent, black 10%, black 90%, transparent);
+        }
+
+        .marquee-content-wrapper.scrolling {
+            /* Animation properties are set by JS */
+            animation-name: marquee-scroll;
+            animation-timing-function: linear;
+            animation-iteration-count: infinite;
+        }
+
+        .marquee-content-wrapper.scrolling:hover {
+            animation-play-state: paused;
+        }
+        
+        @keyframes marquee-scroll {
+            0% { transform: translateY(0); }
+            100% { transform: translateY(-50%); } /* Scrolls exactly one half (the original content) */
+        }
     </style>
 </head>
 
@@ -2333,10 +2396,31 @@
             <p id="last-update-time" class="text-sm text-gray-500 mb-4">Loading...</p>
             <p id="public-inventory-error" class="hidden text-sm text-red-600 mb-4"></p>
             
-            <!-- Replaced table with a div for cards -->
-            <div id="public-inventory-list" class="space-y-4">
-                <!-- JS renders public inventory cards here -->
-                <p class="text-gray-500">Loading inventory...</p>
+            <!-- NEW: Public-side filters -->
+            <div class="flex flex-col md:flex-row gap-4 mb-4 p-4 bg-gray-50 rounded-lg border">
+                <div class="flex-1">
+                    <label for="public-category-filter" class="block text-sm font-medium text-gray-700">Filter by Category</label>
+                    <select id="public-category-filter" class="mt-1 block w-full rounded-lg border-gray-300">
+                        <!-- Options will be added by JS -->
+                    </select>
+                </div>
+                <div class="flex-1">
+                    <label for="public-search-filter" class="block text-sm font-medium text-gray-700">Search by Name/Code</label>
+                    <input type="text" id="public-search-filter" placeholder="Type to search..." class="mt-1 block w-full rounded-lg border-gray-300">
+                </div>
+            </div>
+            
+            <!-- NEW: Marquee container -->
+            <div id="marquee-container" class="marquee-container mt-4">
+                <div id="marquee-content-wrapper">
+                    <!-- This list will be duplicated by JS for the animation -->
+                    <div id="public-inventory-list" class="space-y-4">
+                        <!-- JS renders public inventory cards here -->
+                        <p class="text-gray-500">Loading inventory...</p>
+                    </div>
+                    <!-- This div is for the cloned content -->
+                    <div id="public-inventory-list-clone" class="space-y-4"></div>
+                </div>
             </div>
         </main>
     </div>
