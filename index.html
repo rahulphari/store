@@ -90,7 +90,7 @@
                     action: action,
                     user: user,
                     userId: currentUserId || null,
-                    details: details
+                    details: details // e.g., { itemId: "...", newName: "..." }
                 });
             } catch (error) {
                 console.error("Failed to log activity:", error);
@@ -655,6 +655,7 @@
             
             let newRequestData;
             let requestId;
+            const logPromises = []; // For the item-specific logs
 
             try {
                 // --- ATOMIC TRANSACTION ---
@@ -730,6 +731,15 @@
                                 user: withdrawalUser
                             }
                         });
+                        
+                        // --- BUGFIX: Prepare item-specific log ---
+                        logPromises.push(logActivity("Item Withdrawn", {
+                            requestId: requestId,
+                            itemId: item.productId,
+                            itemName: item.productName,
+                            quantity: item.quantity,
+                            newStock: newStock
+                        }));
                     }
                     
                     // 3d. Write 3: Delete all request list items
@@ -740,7 +750,11 @@
                 // --- TRANSACTION END ---
 
                 // --- POST-TRANSACTION SUCCESS ---
-                await logActivity("Request Placed", { requestId: requestId, items: newRequestData.items.length });
+                // Log the main request
+                logPromises.push(logActivity("Request Placed", { requestId: requestId, items: newRequestData.items.length }));
+                // Log all item withdrawals
+                await Promise.all(logPromises);
+                
                 showToast("Request submitted successfully!");
                 
                 lastRequestCache = { id: requestId, ...newRequestData }; // Save for summary page
@@ -829,20 +843,42 @@
             errorEl.classList.add('hidden');
             
             if (inventory.length === 0) {
-                list.innerHTML = '<tr><td colspan="3" class="px-4 py-3 text-center text-gray-500">No items in inventory.</td></tr>';
+                list.innerHTML = '<p class="text-gray-500">No items in inventory.</p>';
                 return;
             }
             
             inventory.forEach(item => {
                 const inStock = item.stock > 0;
+                
+                // --- New Logic for Last Update ---
+                const addDate = item.lastAddition?.date?.toDate();
+                const withdrawDate = item.lastWithdrawal?.date?.toDate();
+                let lastUpdateHtml = '<p class="text-sm text-gray-500">No recent activity.</p>';
+                
+                if (addDate && (!withdrawDate || addDate > withdrawDate)) {
+                    lastUpdateHtml = `<p class="text-sm text-gray-700">Last Update: <span class="font-medium text-green-700">Added ${item.lastAddition.qty}</span> by ${item.lastAddition.user} on ${addDate.toLocaleString()}</p>`;
+                } else if (withdrawDate) {
+                    lastUpdateHtml = `<p class="text-sm text-gray-700">Last Update: <span class="font-medium text-red-700">Retrieved ${item.lastWithdrawal.qty}</span> by ${item.lastWithdrawal.user} on ${withdrawDate.toLocaleString()}</p>`;
+                }
+                // --- End of New Logic ---
+
                 list.innerHTML += `
-                    <tr class="border-b border-gray-200">
-                        <td class="px-4 py-3 font-medium text-gray-800">${item.name}</td>
-                        <td class="px-4 py-3 text-gray-700">${item.stock}</td>
-                        <td class="px-4 py-3">
-                            ${inStock ? `<span class="font-medium text-green-700">In Stock</span>` : '<span class="font-medium text-red-600">Out of Stock</span>'}
-                        </td>
-                    </tr>
+                    <div class="bg-white p-4 rounded-lg border">
+                        <div class="flex flex-col md:flex-row justify-between md:items-start">
+                            <!-- Left Side: Item Name and Last Update -->
+                            <div class="flex-1">
+                                <h3 class="text-xl font-semibold text-gray-800">${item.name}</h3>
+                                ${lastUpdateHtml} 
+                            </div>
+                            <!-- Right Side: Stock and Status -->
+                            <div class="mt-2 md:mt-0 md:ml-4 text-left md:text-right">
+                                <p class="text-2xl font-bold text-gray-900">${item.stock} <span class="text-sm font-normal text-gray-600">in stock</span></p>
+                                <p class="mt-1">
+                                    ${inStock ? `<span class="font-medium text-green-700">In Stock</span>` : '<span class="font-medium text-red-600">Out of Stock</span>'}
+                                </p>
+                            </div>
+                        </div>
+                    </div>
                 `;
             });
         }
@@ -1600,25 +1636,22 @@
                     let detailsText = log.action;
                     if (log.action === 'Stock Added') {
                         detailsText = `+${log.details.added} (New Stock: ${log.details.newStock})`;
-                    } else if (log.action === 'Request Placed') {
-                        // Find this item in the request
-                        const reqItem = log.details.items?.find(i => i.productId === itemId);
-                        if(reqItem) {
-                            detailsText = `-${reqItem.quantity} (Req ID: ${log.details.requestId.substring(0, 5)}...)`;
-                        } else {
-                            detailsText = 'Request Placed (see log)';
-                        }
+                    } else if (log.action === 'Item Withdrawn') { // --- BUGFIX: Use new log type ---
+                        detailsText = `-${log.details.quantity} (New Stock: ${log.details.newStock}) | Req: ${log.details.requestId.substring(0, 5)}...`;
                     } else if (log.action === 'Inventory Item Name Updated') {
                         detailsText = `Name changed from "${log.details.oldName}" to "${log.details.newName}"`;
                     }
                     
-                    list.innerHTML += `
-                        <div class="p-3 bg-gray-100 rounded-lg font-mono text-sm">
-                            <p><strong>${time}</strong></p>
-                            <p>By: ${log.user}</p>
-                            <p>Action: ${detailsText}</p>
-                        </div>
-                    `;
+                    // Only show logs relevant to this item
+                    if (log.action === 'Stock Added' || log.action === 'Item Withdrawn' || log.action === 'Inventory Item Name Updated' || log.action === 'Inventory Item Added') {
+                        list.innerHTML += `
+                            <div class="p-3 bg-gray-100 rounded-lg font-mono text-sm">
+                                <p><strong>${time}</strong></p>
+                                <p>By: ${log.user}</p>
+                                <p>Action: ${detailsText}</p>
+                            </div>
+                        `;
+                    }
                 });
                 
             } catch (error) {
@@ -1879,20 +1912,10 @@
             <p id="last-update-time" class="text-sm text-gray-500 mb-4">Loading...</p>
             <p id="public-inventory-error" class="hidden text-sm text-red-600 mb-4"></p>
             
-            <div class="overflow-x-auto max-h-[60vh] overflow-y-auto border rounded-lg">
-                <table class="w-full text-left">
-                    <thead class="bg-gray-100 sticky top-0">
-                        <tr>
-                            <th class="px-4 py-3 font-semibold text-gray-700">Item Name</th>
-                            <th class="px-4 py-3 font-semibold text-gray-700">Stock</th>
-                            <th class="px-4 py-3 font-semibold text-gray-700">Status</th>
-                        </tr>
-                    </thead>
-                    <tbody id="public-inventory-list">
-                        <!-- JS renders public inventory here -->
-                        <tr><td colspan="3" class="px-4 py-3 text-center text-gray-500">Loading inventory...</td></tr>
-                    </tbody>
-                </table>
+            <!-- Replaced table with a div for cards -->
+            <div id="public-inventory-list" class="space-y-4">
+                <!-- JS renders public inventory cards here -->
+                <p class="text-gray-500">Loading inventory...</p>
             </div>
         </main>
     </div>
