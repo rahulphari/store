@@ -2396,31 +2396,23 @@
             <p id="last-update-time" class="text-sm text-gray-500 mb-4">Loading...</p>
             <p id="public-inventory-error" class="hidden text-sm text-red-600 mb-4"></p>
             
-            <!-- NEW: Public-side filters -->
+            <!-- UPDATED: Public-side filters (Search Only) -->
             <div class="flex flex-col md:flex-row gap-4 mb-4 p-4 bg-gray-50 rounded-lg border">
-                <div class="flex-1">
-                    <label for="public-category-filter" class="block text-sm font-medium text-gray-700">Filter by Category</label>
-                    <select id="public-category-filter" class="mt-1 block w-full rounded-lg border-gray-300">
-                        <!-- Options will be added by JS -->
-                    </select>
-                </div>
+                <!-- Category Filter DIV removed -->
                 <div class="flex-1">
                     <label for="public-search-filter" class="block text-sm font-medium text-gray-700">Search by Name/Code</label>
                     <input type="text" id="public-search-filter" placeholder="Type to search..." class="mt-1 block w-full rounded-lg border-gray-300">
                 </div>
             </div>
             
-            <!-- NEW: Marquee container -->
-            <div id="marquee-container" class="marquee-container mt-4">
-                <div id="marquee-content-wrapper">
-                    <!-- This list will be duplicated by JS for the animation -->
-                    <div id="public-inventory-list" class="space-y-4">
-                        <!-- JS renders public inventory cards here -->
-                        <p class="text-gray-500">Loading inventory...</p>
-                    </div>
-                    <!-- This div is for the cloned content -->
-                    <div id="public-inventory-list-clone" class="space-y-4"></div>
+            <!-- UPDATED: Marquee container changed to simple scroll container -->
+            <div id="list-scroll-container" class="list-scroll-container mt-4">
+                <!-- This is the list that will scroll -->
+                <div id="public-inventory-list" class="space-y-4">
+                    <!-- JS renders public inventory cards here -->
+                    <p class="text-gray-500">Loading inventory...</p>
                 </div>
+                <!-- Removed clone and wrapper divs -->
             </div>
         </main>
     </div>
