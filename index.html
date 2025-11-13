@@ -33,7 +33,8 @@
             serverTimestamp,
             runTransaction,
             writeBatch,
-            getDocs
+            getDocs,
+            limit
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
 
@@ -41,11 +42,12 @@
         let db, auth;
         let currentUserId, currentUserEmail, currentUserRole;
         let currentUserProfile = null;
-        let lastOrderCache = null; // To hold data for the summary page
+        let lastOrderCache = null;
         
         // Data Caches
         let inventoryCache = [];
         let localCartCache = [];
+        let userRolesCache = []; // Cache for dashboard
 
         // Listeners
         let unsubscribeInventory = () => {};
@@ -53,9 +55,10 @@
         let unsubscribeUserOrders = () => {};
         let unsubscribeManagerOrders = () => {};
         let unsubscribeUserRoles = () => {};
+        let unsubscribeActivityLog = () => {};
+        let unsubscribeDashboardLogs = () => {};
 
         // --- USER'S FIREBASE CONFIG ---
-        // Using the config you provided for "hubli-store"
         const firebaseConfig = {
           apiKey: "AIzaSyDmCSYXnlcXfxt-MvoEkGs0ilVW-E2_Ex4",
           authDomain: "hubli-store.firebaseapp.com",
@@ -66,7 +69,6 @@
           measurementId: "G-FRFB45079Q"
         };
         
-        // This appId is used for the database paths and MUST match your security rules
         const appId = firebaseConfig.projectId; // Using "hubli-store"
         // --- END OF CONFIG ---
 
@@ -75,7 +77,24 @@
         const getInventoryCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'inventory');
         const getUserRolesCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'user_roles');
         const getOrdersCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'orders');
+        const getActivityLogCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'activity_log');
         const getUserCartCollection = (userId) => collection(db, 'artifacts', appId, 'users', userId, 'cart');
+        
+        // Helper function for logging all actions
+        async function logActivity(action, details = {}) {
+            try {
+                const user = currentUserProfile?.name || currentUserEmail || "System";
+                await addDoc(getActivityLogCollection(), {
+                    timestamp: serverTimestamp(),
+                    action: action,
+                    user: user,
+                    userId: currentUserId || null,
+                    details: details
+                });
+            } catch (error) {
+                console.error("Failed to log activity:", error);
+            }
+        }
 
         // --- 1. INITIALIZATION ---
         async function initializeFirebase() {
@@ -116,38 +135,65 @@
 
             if (userDoc.exists()) {
                 const data = userDoc.data();
-                currentUserRole = data.role;
+                currentUserRole = data.role; // 'user', 'manager', or 'superuser'
                 currentUserProfile = {
                     name: data.name || '',
                     empId: data.empId || '',
                     designation: data.designation || '',
-                    email: data.email || user.email // Ensure email is always present
+                    email: data.email || user.email,
+                    status: data.status || 'pending'
                 };
                 
-                // If user has no name, they are a new user who needs to set up their profile.
+                // --- Robust Status Check ---
+                
+                // 1. Suspended? Stop immediately.
+                if (currentUserProfile.status === 'suspended') {
+                    showView('suspended-view');
+                    return;
+                }
+                
+                // 2. Profile incomplete? Force setup.
                 if (!currentUserProfile.name) {
                     renderProfilePage(true); // 'true' for isFirstTime setup
                     showView('profile-setup-view');
-                } else {
-                    // Normal login
+                    return;
+                }
+                
+                // 3. Profile complete, but pending? Force wait.
+                // (Managers/Superusers skip this check)
+                if (currentUserProfile.status === 'pending' && currentUserRole === 'user') {
+                    showView('pending-view');
+                    return;
+                }
+                
+                // 4. Active user, or manager/superuser? Let them in.
+                if (currentUserProfile.status === 'active' || currentUserRole === 'manager' || currentUserRole === 'superuser') {
                     showView('app-container');
                     document.getElementById('user-id-display').textContent = `User: ${currentUserProfile.name} (${currentUserEmail})`;
                     document.getElementById('user-role-display').textContent = `Role: ${currentUserRole}`;
                     setupUIForRole(currentUserRole);
                     attachDataListeners(currentUserRole, userId);
+                    return;
                 }
+
+                // Fallback (shouldn't be reached)
+                console.warn("Unhandled user state:", currentUserProfile);
+                showView('login-view');
+                
             } else {
-                // New user, create a default 'user' role and force profile setup
+                // New user: Create a default 'user' role, force profile setup, and set status to 'pending'
                 currentUserRole = 'user';
                 await setDoc(userRoleRef, { 
                     role: 'user', 
+                    status: 'pending', // All new users are pending
                     created: serverTimestamp(),
                     userId: userId,
                     email: user.email,
-                    name: "", // Empty name signals profile setup is needed
+                    name: "", 
                     empId: "",
                     designation: ""
                 });
+                await logActivity("User Registered", { email: user.email });
                 // Recurse to trigger profile setup
                 await checkUserRoleAndProfile(user);
             }
@@ -169,19 +215,20 @@
                     name: name,
                     empId: empId,
                     designation: designation
+                    // Status remains 'pending'
                 });
                 
+                if (isFirstTime) {
+                    await logActivity("Profile Completed", { name: name });
+                }
+
                 // Update local profile
                 currentUserProfile = { ...currentUserProfile, name, empId, designation };
                 showToast("Profile updated successfully!");
                 
-                if (isFirstTime) {
-                    // First time setup, now log them in properly
-                    await checkUserRoleAndProfile(auth.currentUser);
-                } else {
-                    // Just a normal update, go back to the main app
-                    showView('app-container');
-                }
+                // Re-run check. This will now see the completed profile
+                // and route to the 'pending-view' screen.
+                await checkUserRoleAndProfile(auth.currentUser);
 
             } catch (error) {
                 console.error("Profile update error:", error);
@@ -245,7 +292,7 @@
 
         // --- 3. UI & VIEW MANAGEMENT ---
         function showView(viewId) {
-            ['loading-view', 'login-view', 'app-container', 'profile-setup-view'].forEach(id => {
+            ['loading-view', 'login-view', 'app-container', 'profile-setup-view', 'pending-view', 'suspended-view'].forEach(id => {
                 document.getElementById(id).classList.add('hidden');
             });
             document.getElementById(viewId).classList.remove('hidden');
@@ -273,7 +320,9 @@
         }
 
         function setupUIForRole(role) {
-            if (role === 'manager') {
+            const isManagerOrSuper = (role === 'manager' || role === 'superuser');
+            
+            if (isManagerOrSuper) {
                 document.getElementById('user-interface').classList.add('hidden');
                 document.getElementById('manager-interface').classList.remove('hidden');
                 document.getElementById('manager-nav').classList.remove('hidden');
@@ -313,7 +362,7 @@
         }
 
         function showManagerTab(tabId) {
-            ['dashboard-tab', 'inventory-mgt-tab', 'user-mgt-tab', 'manager-orders-tab', 'user-profile-page'].forEach(id => {
+            ['dashboard-tab', 'inventory-mgt-tab', 'user-mgt-tab', 'manager-orders-tab', 'activity-log-tab', 'user-profile-page'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.classList.add('hidden');
             });
@@ -334,6 +383,7 @@
             if (targetTab) targetTab.classList.remove('hidden');
 
             if (tabId === 'user-profile-page') renderProfilePage(false);
+            if (tabId === 'dashboard-tab') renderDashboard(); // Re-render dashboard on view
         }
         
         function showToast(message, isError = false) {
@@ -348,22 +398,47 @@
                 setTimeout(() => toast.classList.add('hidden'), 500);
             }, 3000);
         }
+        
+        function showConfirmationModal(title, message, onConfirm) {
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-message').textContent = message;
+            
+            // Clone and replace the confirm button to remove old listeners
+            const confirmBtn = document.getElementById('modal-confirm-btn');
+            const newConfirmBtn = confirmBtn.cloneNode(true);
+            confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
+            
+            newConfirmBtn.onclick = () => {
+                onConfirm();
+                closeConfirmationModal();
+            };
+            
+            document.getElementById('confirmation-modal').classList.remove('hidden');
+        }
+
+        function closeConfirmationModal() {
+            document.getElementById('confirmation-modal').classList.add('hidden');
+        }
+
 
         // --- 4. DATA LISTENERS ---
         function attachDataListeners(role, userId) {
+            const isManagerOrSuper = (role === 'manager' || role === 'superuser');
+            
             // 1. Listen to Inventory (all users)
-            const inventoryQuery = query(getInventoryCollection());
+            const inventoryQuery = query(getInventoryCollection(), orderBy('name'));
             unsubscribeInventory = onSnapshot(inventoryQuery, (snapshot) => {
                 inventoryCache = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                inventoryCache.sort((a, b) => a.name.localeCompare(b.name));
                 
                 if (role === 'user') {
                     renderUserInventory(inventoryCache);
                     renderUserCart(localCartCache, inventoryCache); // Re-render cart with fresh names
                 }
-                if (role === 'manager') {
+                if (isManagerOrSuper) {
                     renderManagerInventory(inventoryCache);
-                    renderDashboard(inventoryCache);
+                    if (document.getElementById('dashboard-tab').offsetParent) {
+                        renderDashboard(); // Re-render dashboard if it's visible
+                    }
                 }
             }, (error) => console.error("Inventory listener error:", error));
 
@@ -381,25 +456,43 @@
                 const userOrdersQuery = query(getOrdersCollection(), where('userId', '==', userId), orderBy('createdAt', 'desc'));
                 unsubscribeUserOrders = onSnapshot(userOrdersQuery, (snapshot) => {
                     const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    renderUserOrders(orders, inventoryCache);
+                    renderUserOrders(orders);
                 }, (error) => console.error("User orders listener error:", error));
             }
 
-            // 4. Listen to User Roles & All Orders (only for managers)
-            if (role === 'manager') {
+            // 4. Listen to User Roles, All Orders, Activity Log (only for managers/supers)
+            if (isManagerOrSuper) {
                 // User Roles
-                const usersQuery = query(getUserRolesCollection());
+                const usersQuery = query(getUserRolesCollection(), orderBy('created', 'desc'));
                 unsubscribeUserRoles = onSnapshot(usersQuery, (snapshot) => {
-                    const users = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    renderUserRoles(users);
+                    userRolesCache = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    renderUserRoles(userRolesCache);
+                    if (document.getElementById('dashboard-tab').offsetParent) {
+                        renderDashboard(); // Re-render dashboard for pending user count
+                    }
                 }, (error) => console.error("User roles listener error:", error));
                 
                 // All Orders
                 const allOrdersQuery = query(getOrdersCollection(), orderBy('createdAt', 'desc'));
                 unsubscribeManagerOrders = onSnapshot(allOrdersQuery, (snapshot) => {
                     const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    renderManagerOrders(orders, inventoryCache);
+                    renderManagerOrders(orders);
                 }, (error) => console.error("Manager orders listener error:", error));
+                
+                // Full Activity Log
+                const logQuery = query(getActivityLogCollection(), orderBy('timestamp', 'desc'), limit(50));
+                unsubscribeActivityLog = onSnapshot(logQuery, (snapshot) => {
+                    const logs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    renderActivityLog(logs);
+                }, (error) => console.error("Activity log listener error:", error));
+                
+                // Dashboard Activity Log (just 5 items)
+                const dashLogQuery = query(getActivityLogCollection(), orderBy('timestamp', 'desc'), limit(5));
+                unsubscribeDashboardLogs = onSnapshot(dashLogQuery, (snapshot) => {
+                    if (document.getElementById('dashboard-tab').offsetParent) {
+                        renderDashboardRecentActivity(snapshot.docs);
+                    }
+                }, (error) => console.error("Dashboard log listener error:", error));
             }
         }
 
@@ -409,6 +502,8 @@
             unsubscribeUserOrders();
             unsubscribeManagerOrders();
             unsubscribeUserRoles();
+            unsubscribeActivityLog();
+            unsubscribeDashboardLogs();
         }
 
         // --- 5. REGULAR USER: ACTIONS & RENDERING ---
@@ -432,8 +527,8 @@
                         transaction.update(cartItemRef, { quantity: newQuantity });
                     } else {
                         transaction.set(cartItemRef, {
-                            productId: itemId, // Store ID for future reference
-                            productName: itemName, // Store name at time of add
+                            productId: itemId,
+                            productName: itemName,
                             quantity: 1,
                             addedAt: serverTimestamp()
                         });
@@ -517,9 +612,9 @@
                 }
 
                 itemsWithDetails.push({
-                    ...item, // contains productId, productName, quantity
+                    ...item,
                     type: type,
-                    individualInfo: individualInfo, // null if type is 'operations'
+                    individualInfo: individualInfo,
                     remarks: document.getElementById(`remarks-${item.id}`).value.trim()
                 });
             }
@@ -540,7 +635,7 @@
             // This object will be saved to Firestore
             const newOrder = {
                 userId: currentUserId,
-                userProfile: currentUserProfile, // Save a snapshot of the user's profile
+                userProfile: currentUserProfile,
                 status: "pending",
                 createdAt: serverTimestamp(),
                 supervisorName: supervisorName,
@@ -548,25 +643,54 @@
             };
 
             try {
+                // --- TRANSACTION FIX ---
                 await runTransaction(db, async (transaction) => {
+                    // 1. Read Phase: Get all item documents first
+                    const inventoryDocs = new Map();
+                    const readPromises = itemsWithDetails.map(item => {
+                        const itemRef = doc(getInventoryCollection(), item.productId);
+                        return transaction.get(itemRef).then(doc => inventoryDocs.set(item.productId, doc));
+                    });
+                    await Promise.all(readPromises);
+
+                    // 2. Validation Phase: Check stock for all items
                     for (const item of itemsWithDetails) {
-                        const inventoryRef = doc(getInventoryCollection(), item.productId);
-                        const inventoryDoc = await transaction.get(inventoryRef);
-                        
-                        if (!inventoryDoc.exists()) throw new Error(`Item "${item.productName}" not found.`);
-                        
-                        const currentStock = inventoryDoc.data().stock;
-                        if (currentStock < item.quantity) {
-                            throw new Error(`Not enough stock for "${item.productName}". Only ${currentStock} left.`);
+                        const inventoryDoc = inventoryDocs.get(item.productId);
+                        if (!inventoryDoc || !inventoryDoc.exists()) {
+                            throw new Error(`Item "${item.productName}" not found.`);
                         }
-                        
+                        const data = inventoryDoc.data();
+                        if (data.stock < item.quantity) {
+                            throw new Error(`Not enough stock for "${item.productName}". Only ${data.stock} left.`);
+                        }
+                    }
+
+                    // 3. Write Phase: All checks passed, update all documents
+                    const withdrawalTime = serverTimestamp();
+                    const withdrawalUser = currentUserProfile.name;
+                    
+                    for (const item of itemsWithDetails) {
+                        const itemRef = doc(getInventoryCollection(), item.productId);
+                        const currentStock = inventoryDocs.get(item.productId).data().stock;
                         const newStock = currentStock - item.quantity;
-                        transaction.update(inventoryRef, { stock: newStock });
+                        
+                        transaction.update(itemRef, { 
+                            stock: newStock,
+                            lastWithdrawal: {
+                                qty: item.quantity,
+                                date: withdrawalTime,
+                                user: withdrawalUser
+                            }
+                        });
                     }
                 });
+                // --- TRANSACTION END ---
 
                 // Transaction succeeded, now create the order
                 const orderRef = await addDoc(getOrdersCollection(), newOrder);
+                
+                // Log activity
+                await logActivity("Order Placed", { orderId: orderRef.id, items: itemsWithDetails.length });
 
                 // Clear the user's cart
                 const batch = writeBatch(db);
@@ -626,12 +750,9 @@
                 summaryText += `\n`;
             });
             
-            // Fallback for clipboard
             const textArea = document.createElement("textarea");
             textArea.value = summaryText;
-            textArea.style.position = "fixed"; //-remove from view
-            textArea.style.left = "-9999px";
-            textArea.style.top = "-9999px";
+            textArea.style.position = "fixed"; textArea.style.left = "-9999px"; textArea.style.top = "-9999px";
             document.body.appendChild(textArea);
             textArea.focus();
             textArea.select();
@@ -655,7 +776,6 @@
             const title = isFirstTime ? "Welcome! Let's set up your profile." : "My Profile";
             const buttonText = isFirstTime ? "Save and Continue" : "Update Profile";
             
-            // Populate fields if profile exists
             const name = currentUserProfile?.name || '';
             const empId = currentUserProfile?.empId || '';
             const designation = currentUserProfile?.designation || '';
@@ -664,7 +784,7 @@
             targetContainer.innerHTML = `
                 <div class="bg-white p-6 md:p-8 rounded-xl shadow-xl max-w-2xl mx-auto">
                     <h2 class="text-2xl font-semibold mb-5">${title}</h2>
-                    ${isFirstTime ? '<p class="text-gray-600 mb-6">Please complete your profile to continue.</p>' : ''}
+                    ${isFirstTime ? '<p class="text-gray-600 mb-6">Please complete your profile to continue. Your account will be pending approval from a manager.</p>' : ''}
                     
                     <div class="space-y-4">
                         <div>
@@ -691,7 +811,6 @@
                 </div>
             `;
             
-            // Add event listener to the new button
             document.getElementById('update-profile-btn').onclick = () => handleProfileUpdate(isFirstTime);
         }
         
@@ -746,7 +865,6 @@
                     totalItems += item.quantity;
                     const inventoryItem = inventory.find(inv => inv.id === item.productId);
                     const currentName = inventoryItem ? inventoryItem.name : item.productName;
-                    const maxStock = inventoryItem ? inventoryItem.stock : item.quantity; // Use item.quantity as fallback
                     
                     list.innerHTML += `
                         <div class="bg-white p-3 rounded-xl shadow-md flex justify-between items-center">
@@ -775,8 +893,6 @@
         function renderCheckoutPage() {
             const list = document.getElementById('checkout-items-list');
             list.innerHTML = '';
-            
-            // Reset supervisor name
             document.getElementById('supervisor-name').value = '';
             
             if (localCartCache.length === 0) {
@@ -794,7 +910,6 @@
                     <div class="bg-white p-4 rounded-xl shadow-md space-y-4" id="item-form-${item.id}">
                         <h4 class="text-lg font-semibold text-gray-800">${currentName} (Qty: ${item.quantity})</h4>
                         
-                        <!-- Type Selection -->
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Type:</label>
                             <div classs="mt-2 flex gap-4">
@@ -809,7 +924,6 @@
                             </div>
                         </div>
                         
-                        <!-- Individual Fields (hidden by default) -->
                         <div id="individual-fields-${item.id}" class="hidden space-y-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
                             <label class="block text-sm font-medium text-gray-700">For:</label>
                             <div class="flex gap-4">
@@ -830,7 +944,6 @@
                             </div>
                         </div>
                         
-                        <!-- Remarks -->
                         <div>
                             <label for="remarks-${item.id}" class="block text-sm font-medium text-gray-700">Other Remarks:</label>
                             <input type="text" id="remarks-${item.id}" class="checkout-remarks-input mt-1 block w-full rounded-lg border-gray-300 sm:text-sm" placeholder="Optional">
@@ -840,7 +953,6 @@
             });
         }
         
-        // --- Helper functions for checkout form ---
         window.toggleIndividualFields = (itemId, show) => {
             document.getElementById(`individual-fields-${itemId}`).classList.toggle('hidden', !show);
         };
@@ -855,10 +967,7 @@
                 return;
             }
             
-            // Show/hide copy button
             document.getElementById('copy-summary-btn').classList.toggle('hidden', !justCreated);
-
-            // Format date
             const orderDate = order.createdAt?.toDate ? order.createdAt.toDate().toLocaleString() : 'Just now';
             
             let itemsHtml = '';
@@ -911,7 +1020,7 @@
             `;
         }
         
-        function renderUserOrders(orders, inventory) {
+        function renderUserOrders(orders) {
             const list = document.getElementById('user-orders-list');
             if (!list) return;
             list.innerHTML = '';
@@ -941,13 +1050,12 @@
                 `;
             });
             
-            // Add viewOrderDetails to window
             window.viewOrderDetails = async (orderId) => {
                 const orderRef = doc(getOrdersCollection(), orderId);
                 const orderDoc = await getDoc(orderRef);
                 if (orderDoc.exists()) {
                     lastOrderCache = { id: orderDoc.id, ...orderDoc.data() };
-                    renderOrderSummaryPage(lastOrderCache, false); // false = not just created
+                    renderOrderSummaryPage(lastOrderCache, false);
                     showUserPage('order-summary-page');
                 } else {
                     showToast("Order not found.", true);
@@ -955,33 +1063,92 @@
             };
         }
 
-
         // --- 6. MANAGER: ACTIONS & RENDERING ---
         
-        function renderDashboard(inventory) {
-            const totalSpan = document.getElementById('dashboard-summary-total');
-            const lowStockList = document.getElementById('low-stock-list');
-            if (!totalSpan || !lowStockList) return;
-
-            totalSpan.textContent = inventory.length;
-
-            const lowStockItems = inventory.filter(item => item.stock <= item.lowStockThreshold);
-            lowStockList.innerHTML = '';
+        // --- NEW DASHBOARD ---
+        function renderDashboard() {
+            const kpiPending = document.getElementById('kpi-pending-users');
+            const kpiLowStock = document.getElementById('kpi-low-stock');
+            const kpiTotalItems = document.getElementById('kpi-total-items');
             
-            if (lowStockItems.length === 0) {
-                lowStockList.innerHTML = '<li class="text-gray-500">All items are well-stocked.</li>';
-                return;
+            if (!kpiPending || !kpiLowStock || !kpiTotalItems) return;
+            
+            // 1. Render KPIs from cache
+            const pendingUsers = userRolesCache.filter(user => user.status === 'pending').length;
+            const lowStockItems = inventoryCache.filter(item => item.stock <= item.lowStockThreshold).length;
+            const totalItems = inventoryCache.length;
+            
+            kpiPending.textContent = pendingUsers;
+            kpiLowStock.textContent = lowStockItems;
+            kpiTotalItems.textContent = totalItems;
+            kpiPending.classList.toggle('text-red-500', pendingUsers > 0);
+            kpiLowStock.classList.toggle('text-red-500', lowStockItems > 0);
+            
+            // 2. Render Pending Users List
+            const pendingList = document.getElementById('dashboard-pending-list');
+            const pendingUsersToShow = userRolesCache.filter(user => user.status === 'pending').slice(0, 5);
+            pendingList.innerHTML = '';
+            if (pendingUsersToShow.length === 0) {
+                pendingList.innerHTML = '<p class="text-sm text-gray-500">No users pending approval.</p>';
+            } else {
+                pendingUsersToShow.forEach(user => {
+                    pendingList.innerHTML += `
+                        <div class="flex justify-between items-center p-2 rounded-lg hover:bg-gray-100">
+                            <div>
+                                <p class="font-semibold text-gray-800">${user.name || 'Profile Not Setup'}</p>
+                                <p class="text-sm text-gray-600">${user.email}</p>
+                            </div>
+                            <button onclick="handleApproveUser('${user.id}', '${user.name}')" class="bg-green-500 hover:bg-green-600 text-white py-1 px-3 rounded-lg font-semibold text-sm">
+                                Approve
+                            </button>
+                        </div>
+                    `;
+                });
             }
             
-            lowStockItems.forEach(item => {
-                lowStockList.innerHTML += `
-                    <li class="flex justify-between items-center p-3 bg-white rounded-xl shadow-md">
-                        <span class="font-medium text-gray-800">${item.name}</span>
-                        <span class="font-bold text-red-600">Stock: ${item.stock}</span>
-                    </li>
+            // 3. Render Low Stock List
+            const lowStockList = document.getElementById('dashboard-low-stock-list');
+            const lowStockItemsToShow = inventoryCache.filter(item => item.stock <= item.lowStockThreshold).slice(0, 5);
+            lowStockList.innerHTML = '';
+            if (lowStockItemsToShow.length === 0) {
+                lowStockList.innerHTML = '<p class="text-sm text-gray-500">All stock levels look good!</p>';
+            } else {
+                lowStockItemsToShow.forEach(item => {
+                    lowStockList.innerHTML += `
+                        <div class="flex justify-between items-center p-2 rounded-lg hover:bg-gray-100">
+                            <div>
+                                <p class="font-semibold text-gray-800">${item.name}</p>
+                                <p class="text-sm font-bold text-red-600">Stock: ${item.stock}</p>
+                            </div>
+                            <button onclick="handleOpenAddStockModal('${item.id}', '${item.name}', ${item.stock})" class="bg-blue-500 hover:bg-blue-600 text-white py-1 px-3 rounded-lg font-semibold text-sm">
+                                Add Stock
+                            </button>
+                        </div>
+                    `;
+                });
+            }
+        }
+        
+        function renderDashboardRecentActivity(logDocs) {
+            const list = document.getElementById('dashboard-recent-activity');
+            if (!list) return;
+            list.innerHTML = '';
+            if (logDocs.length === 0) {
+                list.innerHTML = '<p class="text-sm text-gray-500">No recent activity.</p>';
+                return;
+            }
+            logDocs.forEach(doc => {
+                const log = doc.data();
+                const time = log.timestamp?.toDate ? log.timestamp.toDate().toLocaleString() : 'Just now';
+                list.innerHTML += `
+                    <div class="p-2 border-b border-gray-200">
+                        <p class="font-semibold text-gray-800 text-sm">${log.action}</p>
+                        <p class="text-xs text-gray-600">By: ${log.user} | ${time}</p>
+                    </div>
                 `;
             });
         }
+        // --- END NEW DASHBOARD ---
 
         function renderManagerInventory(inventory) {
             const list = document.getElementById('manager-inventory-list');
@@ -994,25 +1161,63 @@
             }
 
             inventory.forEach(item => {
+                const lastAddDate = item.lastAddition?.date?.toDate ? item.lastAddition.date.toDate().toLocaleDateString() : 'N/A';
+                const lastAddQty = item.lastAddition?.qty || 0;
+                const lastAddUser = item.lastAddition?.user || 'N/A';
+                
+                const lastWithdrawDate = item.lastWithdrawal?.date?.toDate ? item.lastWithdrawal.date.toDate().toLocaleDateString() : 'N/A';
+                const lastWithdrawQty = item.lastWithdrawal?.qty || 0;
+                const lastWithdrawUser = item.lastWithdrawal?.user || 'N/A';
+                
+                let superuserButtons = '';
+                if (currentUserRole === 'superuser') {
+                    superuserButtons = `
+                        <button onclick="handleDeleteItem('${item.id}', '${item.name}')" class="w-full bg-red-600 text-white py-2 px-4 rounded-lg hover:bg-red-700 font-semibold shadow-md transition-all">
+                            DELETE ITEM
+                        </button>
+                    `;
+                }
+                
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-lg space-y-3">
+                    <div class="bg-white p-4 rounded-xl shadow-lg space-y-4">
+                        <div class="flex flex-col md:flex-row justify-between md:items-center">
+                            <h3 class="text-xl font-semibold text-gray-800">${item.name}</h3>
+                            <span class="font-bold text-2xl text-blue-600">Stock: ${item.stock}</span>
+                        </div>
+                        
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                            <div class="p-3 bg-green-50 rounded-lg border border-green-200">
+                                <h4 class="font-semibold text-green-800">Last Addition</h4>
+                                <p>Qty: <span class="font-medium">+${lastAddQty}</span></p>
+                                <p>Date: ${lastAddDate}</p>
+                                <p>By: ${lastAddUser}</p>
+                            </div>
+                            <div class="p-3 bg-red-50 rounded-lg border border-red-200">
+                                <h4 class="font-semibold text-red-800">Last Withdrawal</h4>
+                                <p>Qty: <span class="font-medium">-${lastWithdrawQty}</span></p>
+                                <p>Date: ${lastWithdrawDate}</p>
+                                <p>By: ${lastWithdrawUser}</p>
+                            </div>
+                        </div>
+                        
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                            <div>
-                                <label for="name-${item.id}" class="text-xs font-medium text-gray-600">Item Name</label>
-                                <input type="text" id="name-${item.id}" value="${item.name}" class="mt-1 w-full p-2 border border-gray-300 rounded-lg">
-                            </div>
-                             <div>
-                                <label for="stock-${item.id}" class="text-xs font-medium text-gray-600">Stock</label>
-                                <input type="number" id="stock-${item.id}" value="${item.stock}" class="mt-1 w-full p-2 border border-gray-300 rounded-lg">
-                            </div>
                              <div>
                                 <label for="lowstock-${item.id}" class="text-xs font-medium text-gray-600">Low Stock At</label>
                                 <input type="number" id="lowstock-${item.id}" value="${item.lowStockThreshold}" class="mt-1 w-full p-2 border border-gray-300 rounded-lg">
                             </div>
+                            <button onclick="handleUpdateItemThreshold('${item.id}')" class="md:mt-6 bg-gray-600 text-white py-2 px-4 rounded-lg hover:bg-gray-700 font-semibold shadow-md transition-all">
+                                Save Threshold
+                            </button>
+                             <button onclick="handleOpenAddStockModal('${item.id}', '${item.name}', ${item.stock})" class="md:mt-6 bg-blue-500 text-white py-2 px-4 rounded-lg hover:bg-blue-600 font-semibold shadow-md transition-all">
+                                Add Stock
+                            </button>
                         </div>
-                        <button onclick="handleUpdateInventoryItem('${item.id}')" class="w-full md:w-auto bg-blue-500 text-white py-2 px-4 rounded-lg hover:bg-blue-600 font-semibold shadow-md transition-all">
-                            Save Changes
-                        </button>
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <button onclick="handleEditItemName('${item.id}', '${item.name}')" class="bg-yellow-500 text-white py-2 px-4 rounded-lg hover:bg-yellow-600 font-semibold shadow-md transition-all">
+                                Edit Name
+                            </button>
+                            ${superuserButtons}
+                        </div>
                     </div>
                 `;
             });
@@ -1025,30 +1230,78 @@
             
             users.forEach(user => {
                 const isCurrentUser = user.id === currentUserId;
+                let statusBadge = '';
+                switch (user.status) {
+                    case 'active': statusBadge = '<span class="text-xs font-medium px-2 py-1 bg-green-100 text-green-800 rounded-full">Active</span>'; break;
+                    case 'pending': statusBadge = '<span class="text-xs font-medium px-2 py-1 bg-yellow-100 text-yellow-800 rounded-full">Pending</span>'; break;
+                    case 'suspended': statusBadge = '<span class="text-xs font-medium px-2 py-1 bg-red-100 text-red-800 rounded-full">Suspended</span>'; break;
+                    default: statusBadge = `<span class="text-xs font-medium px-2 py-1 bg-gray-100 text-gray-800 rounded-full">${user.status || 'Unknown'}</span>`;
+                }
+                
+                // Determine delete permissions
+                let canDelete = false;
+                if (currentUserRole === 'superuser' && !isCurrentUser) {
+                    canDelete = true;
+                } else if (currentUserRole === 'manager' && user.role === 'user' && !isCurrentUser) {
+                    // Managers can only delete regular users (not other managers or themselves)
+                    canDelete = true;
+                }
+                
+                // Determine role change permissions
+                let canChangeRole = false;
+                if (currentUserRole === 'superuser' && !isCurrentUser) {
+                    canChangeRole = true;
+                } else if (currentUserRole === 'manager' && user.role === 'user' && !isCurrentUser) {
+                    // Managers can only change roles of regular users
+                    canChangeRole = true;
+                }
+
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-lg flex flex-col md:flex-row justify-between md:items-center gap-4">
-                        <div class="mb-2 md:mb-0 flex-1">
-                            <p class="font-semibold text-gray-800">${user.name || 'Profile Not Setup'}</p>
+                    <div class="bg-white p-4 rounded-xl shadow-lg flex flex-col md:flex-row justify-between gap-4">
+                        <div class="flex-1">
+                            <p class="font-semibold text-gray-800">${user.name || 'Profile Not Setup'} ${statusBadge}</p>
                             <p class="text-sm text-gray-600">${user.email || 'N/A'}</p>
+                            <p class="text-sm text-gray-600">${user.designation || 'N/A'}</p>
                             <p class="text-sm text-gray-600 break-all"><span class="font-medium">User ID:</span> ${user.userId}</p>
                         </div>
-                        <div class="flex items-center gap-3">
-                            <select id="role-${user.id}" class="p-2 border border-gray-300 rounded-lg" ${isCurrentUser ? 'disabled' : ''}>
-                                <option value="user" ${user.role === 'user' ? 'selected' : ''}>Regular User</option>
+                        <div class="flex flex-wrap items-center gap-2">
+                            ${user.status === 'pending' ? `
+                                <button onclick="handleApproveUser('${user.id}', '${user.name}')" class="bg-green-500 hover:bg-green-600 text-white py-2 px-3 rounded-lg font-semibold text-sm">
+                                    Approve
+                                </button>
+                            ` : ''}
+                            ${user.status === 'active' && !isCurrentUser && user.role === 'user' ? `
+                                <button onclick="handleSuspendUser('${user.id}', '${user.name}', true)" class="bg-yellow-500 hover:bg-yellow-600 text-white py-2 px-3 rounded-lg font-semibold text-sm">
+                                    Suspend
+                                </button>
+                            ` : ''}
+                             ${user.status === 'suspended' && !isCurrentUser ? `
+                                <button onclick="handleSuspendUser('${user.id}', '${user.name}', false)" class="bg-green-500 hover:bg-green-600 text-white py-2 px-3 rounded-lg font-semibold text-sm">
+                                    Re-activate
+                                </button>
+                            ` : ''}
+                            <select id="role-${user.id}" class="p-2 border border-gray-300 rounded-lg text-sm" ${!canChangeRole ? 'disabled' : ''}>
+                                <option value="user" ${user.role === 'user' ? 'selected' : ''}>User</option>
                                 <option value="manager" ${user.role === 'manager' ? 'selected' : ''}>Manager</option>
+                                ${currentUserRole === 'superuser' ? `<option value="superuser" ${user.role === 'superuser' ? 'selected' : ''}>Superuser</option>` : ''}
                             </select>
                             <button onclick="handleUpdateUserRole('${user.id}')" 
-                                class="${isCurrentUser ? 'bg-gray-300 cursor-not-allowed' : 'bg-blue-500 hover:bg-blue-600'} text-white py-2 px-4 rounded-lg font-semibold"
-                                ${isCurrentUser ? 'disabled' : ''}>
-                                Save
+                                class="${!canChangeRole ? 'bg-gray-300 cursor-not-allowed' : 'bg-blue-500 hover:bg-blue-600'} text-white py-2 px-3 rounded-lg font-semibold text-sm"
+                                ${!canChangeRole ? 'disabled' : ''}>
+                                Update Role
                             </button>
+                            ${canDelete ? `
+                                <button onclick="handleDeleteUser('${user.id}', '${user.email}')" class="bg-red-600 hover:bg-red-700 text-white py-2 px-3 rounded-lg font-semibold text-sm">
+                                    Delete
+                                </button>
+                            ` : ''}
                         </div>
                     </div>
                 `;
             });
         }
         
-        function renderManagerOrders(orders, inventory) {
+        function renderManagerOrders(orders) {
             const list = document.getElementById('manager-orders-list');
             if (!list) return;
             list.innerHTML = '';
@@ -1062,6 +1315,11 @@
                 const totalItems = order.items.reduce((sum, item) => sum + item.quantity, 0);
                 const orderDate = order.createdAt?.toDate ? order.createdAt.toDate().toLocaleString() : 'Pending';
                 
+                let superuserButton = '';
+                if (currentUserRole === 'superuser') {
+                    superuserButton = `<button onclick="handleDeleteOrder('${order.id}')" class="bg-red-500 text-white font-semibold py-1 px-3 rounded-lg hover:bg-red-600 text-sm">Delete</button>`;
+                }
+
                 list.innerHTML += `
                     <div class="bg-white p-4 rounded-xl shadow-lg transition-all duration-300 hover:shadow-xl">
                         <div class="flex justify-between items-center">
@@ -1071,23 +1329,24 @@
                                 <p class="text-gray-600">${orderDate}</p>
                                 <p class="text-gray-600">Total Items: ${totalItems}</p>
                             </div>
-                            <button onclick="viewManagerOrderDetails('${order.id}')" class="bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-600">
-                                View
-                            </button>
+                            <div class="flex flex-col gap-2 items-end">
+                                <button onclick="viewManagerOrderDetails('${order.id}')" class="bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-600">
+                                    View
+                                </button>
+                                ${superuserButton}
+                            </div>
                         </div>
                     </div>
                 `;
             });
             
-            // Add viewManagerOrderDetails to window
             window.viewManagerOrderDetails = async (orderId) => {
                 const orderRef = doc(getOrdersCollection(), orderId);
                 const orderDoc = await getDoc(orderRef);
                 if (orderDoc.exists()) {
                     lastOrderCache = { id: orderDoc.id, ...orderDoc.data() };
-                    renderOrderSummaryPage(lastOrderCache, false); // false = not just created
-                    // Need a way to show summary page in manager view
-                    // For now, let's just re-use the user-page
+                    renderOrderSummaryPage(lastOrderCache, false);
+                    // Switch view to user interface to show the summary page
                     document.getElementById('manager-interface').classList.add('hidden');
                     document.getElementById('user-interface').classList.remove('hidden');
                     showUserPage('order-summary-page');
@@ -1095,6 +1354,42 @@
                     showToast("Order not found.", true);
                 }
             };
+        }
+        
+        function renderActivityLog(logs) {
+            const list = document.getElementById('activity-log-list');
+            if (!list) return;
+            list.innerHTML = '';
+            if (logs.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">No activities logged yet.</p>';
+                return;
+            }
+            
+            logs.forEach(log => {
+                const time = log.timestamp?.toDate ? log.timestamp.toDate().toLocaleString() : 'Just now';
+                
+                let superuserButton = '';
+                if (currentUserRole === 'superuser') {
+                    superuserButton = `<button onclick="handleDeleteLog('${log.id}')" class="text-red-500 hover:text-red-700 text-xs font-semibold">Delete Log</button>`;
+                }
+                
+                list.innerHTML += `
+                    <div class="p-3 bg-white rounded-lg shadow-sm border-l-4 border-blue-500">
+                        <div class="flex justify-between items-start">
+                            <div>
+                                <p class="font-semibold text-gray-800">${log.action}</p>
+                                <p class="text-sm text-gray-600">By: <span class="font-medium">${log.user}</span></p>
+                                <p class="text-sm text-gray-600">When: ${time}</p>
+                                <details class="mt-2 text-xs">
+                                    <summary class="cursor-pointer text-gray-500">Details</summary>
+                                    <pre class="mt-2 p-2 bg-gray-100 rounded overflow-auto">${JSON.stringify(log.details, null, 2)}</pre>
+                                </details>
+                            </div>
+                            ${superuserButton}
+                        </div>
+                    </div>
+                `;
+            });
         }
         
         // --- MANAGER: ACTIONS ---
@@ -1109,12 +1404,23 @@
             }
             
             try {
-                await addDoc(getInventoryCollection(), {
+                const itemRef = await addDoc(getInventoryCollection(), {
                     name: name,
                     stock: stock,
                     lowStockThreshold: lowStock,
-                    addedAt: serverTimestamp()
+                    addedAt: serverTimestamp(),
+                    lastAddition: {
+                        qty: stock,
+                        date: serverTimestamp(),
+                        user: currentUserProfile.name
+                    },
+                    lastWithdrawal: {
+                        qty: 0,
+                        date: null,
+                        user: null
+                    }
                 });
+                await logActivity("Inventory Item Added", { itemId: itemRef.id, name: name, stock: stock });
                 showToast("Item added to inventory.");
                 document.getElementById('item-name').value = '';
                 document.getElementById('item-stock').value = '10';
@@ -1125,30 +1431,115 @@
             }
         }
         
-        async function handleUpdateInventoryItem(itemId) {
-            const name = document.getElementById(`name-${itemId}`).value.trim();
-            const stock = parseInt(document.getElementById(`stock-${itemId}`).value, 10);
-            const lowStock = parseInt(document.getElementById(`lowstock-${itemId}`).value, 10);
-            
-            if (!name || isNaN(stock) || stock < 0 || isNaN(lowStock) || lowStock < 0) {
-                showToast("Please enter valid details for the item.", true);
+        async function handleEditItemName(itemId, oldName) {
+            const newName = prompt("Enter new name for item:", oldName);
+            if (!newName || newName.trim() === '' || newName === oldName) {
+                showToast("Edit cancelled or name unchanged.", true);
                 return;
             }
             
             const itemRef = doc(getInventoryCollection(), itemId);
             try {
-                await updateDoc(itemRef, { 
-                    name: name,
-                    stock: stock,
-                    lowStockThreshold: lowStock
-                });
-                showToast("Item updated successfully.");
+                await updateDoc(itemRef, { name: newName.trim() });
+                await logActivity("Inventory Item Name Updated", { itemId: itemId, oldName: oldName, newName: newName.trim() });
+                showToast("Item name updated.");
             } catch (error) {
-                console.error("Update item error: ", error);
-                showToast("Failed to update item.", true);
+                console.error("Update item name error: ", error);
+                showToast("Failed to update item name.", true);
             }
         }
         
+        async function handleUpdateItemThreshold(itemId) {
+            const lowStock = parseInt(document.getElementById(`lowstock-${itemId}`).value, 10);
+            if (isNaN(lowStock) || lowStock < 0) {
+                showToast("Please enter a valid low stock threshold.", true);
+                return;
+            }
+            
+            const itemRef = doc(getInventoryCollection(), itemId);
+            try {
+                await updateDoc(itemRef, { lowStockThreshold: lowStock });
+                await logActivity("Inventory Threshold Updated", { itemId: itemId, newThreshold: lowStock });
+                showToast("Low stock threshold updated.");
+            } catch (error) {
+                console.error("Update threshold error: ", error);
+                showToast("Failed to update threshold.", true);
+            }
+        }
+        
+        function handleOpenAddStockModal(itemId, itemName, currentStock) {
+            document.getElementById('modal-stock-item-name').textContent = itemName;
+            document.getElementById('modal-stock-current').textContent = currentStock;
+            document.getElementById('modal-stock-add-qty').value = '';
+            
+            // Clone and replace button to remove old listener
+            const confirmBtn = document.getElementById('modal-stock-confirm-btn');
+            const newConfirmBtn = confirmBtn.cloneNode(true);
+            confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
+            
+            newConfirmBtn.onclick = () => handleConfirmAddStock(itemId, currentStock);
+            
+            document.getElementById('add-stock-modal').classList.remove('hidden');
+        }
+        
+        function closeAddStockModal() {
+            document.getElementById('add-stock-modal').classList.add('hidden');
+        }
+        
+        async function handleConfirmAddStock(itemId, currentStock) {
+            const qtyToAdd = parseInt(document.getElementById('modal-stock-add-qty').value, 10);
+            if (isNaN(qtyToAdd) || qtyToAdd <= 0) {
+                showToast("Please enter a valid quantity to add.", true);
+                return;
+            }
+            
+            const newStock = currentStock + qtyToAdd;
+            const itemRef = doc(getInventoryCollection(), itemId);
+            
+            try {
+                await updateDoc(itemRef, {
+                    stock: newStock,
+                    lastAddition: {
+                        qty: qtyToAdd,
+                        date: serverTimestamp(),
+                        user: currentUserProfile.name
+                    }
+                });
+                await logActivity("Stock Added", { itemId: itemId, added: qtyToAdd, newStock: newStock });
+                showToast("Stock added successfully.");
+                closeAddStockModal();
+            } catch (error) {
+                console.error("Add stock error: ", error);
+                showToast("Failed to add stock.", true);
+            }
+        }
+        
+        async function handleApproveUser(userId, name) {
+            const userRef = doc(getUserRolesCollection(), userId);
+            try {
+                await updateDoc(userRef, { status: 'active' });
+                await logActivity("User Approved", { approvedUserId: userId, name: name });
+                showToast("User approved successfully.");
+            } catch (error) {
+                console.error("Approve user error:", error);
+                showToast("Failed to approve user.", true);
+            }
+        }
+        
+        async function handleSuspendUser(userId, name, shouldSuspend) {
+            const newStatus = shouldSuspend ? 'suspended' : 'active';
+            const action = shouldSuspend ? 'User Suspended' : 'User Re-activated';
+            const userRef = doc(getUserRolesCollection(), userId);
+            try {
+                await updateDoc(userRef, { status: newStatus });
+                await logActivity(action, { targetUserId: userId, name: name });
+                showToast(`User ${newStatus} successfully.`);
+            } catch (error) {
+                console.error("Suspend/activate user error:", error);
+                showToast("Failed to update user status.", true);
+            }
+        }
+
         async function handleUpdateUserRole(userId) {
             if (userId === currentUserId) {
                 showToast("You cannot change your own role.", true);
@@ -1161,12 +1552,92 @@
             const userRoleRef = doc(getUserRolesCollection(), userId);
             try {
                 await updateDoc(userRoleRef, { role: newRole });
+                await logActivity("User Role Changed", { targetUserId: userId, newRole: newRole });
                 showToast("User role updated successfully.");
             } catch (error) {
                 console.error("Update role error: ", error);
                 showToast("Failed to update user role.", true);
             }
         }
+        
+        async function handleDeleteUser(userId, email) {
+            showConfirmationModal(
+                "Delete User Data?",
+                `This will delete all app data (profile, cart) for ${email}. It will NOT delete their login account. You must do that from the Firebase Console. This action is irreversible.`,
+                async () => {
+                    try {
+                        // 1. Delete user role doc
+                        const userRoleRef = doc(getUserRolesCollection(), userId);
+                        await deleteDoc(userRoleRef);
+                        
+                        // 2. Delete user's cart (recursive delete)
+                        const cartRef = getUserCartCollection(userId);
+                        const cartSnapshot = await getDocs(cartRef);
+                        const batch = writeBatch(db);
+                        cartSnapshot.forEach(doc => {
+                            batch.delete(doc.ref);
+                        });
+                        await batch.commit();
+                        
+                        // 3. Log it
+                        await logActivity("User Data Deleted", { deletedUserId: userId, email: email });
+                        showToast("User data deleted. Remember to delete their login from the Auth console.");
+
+                    } catch (error) {
+                        console.error("Delete user error:", error);
+                        showToast("Failed to delete user data.", true);
+                    }
+                }
+            );
+        }
+        
+        // --- SUPERUSER ACTIONS ---
+        async function handleDeleteLog(logId) {
+            // Superusers don't need confirmation
+            try {
+                await deleteDoc(doc(getActivityLogCollection(), logId));
+                showToast("Log entry deleted.");
+                // Log will disappear from listener
+            } catch (error) {
+                console.error("Delete log error:", error);
+                showToast("Could not delete log.", true);
+            }
+        }
+        
+        async function handleDeleteOrder(orderId) {
+            showConfirmationModal(
+                "Delete Order?",
+                `Superuser: Delete this entire order (${orderId})? This is irreversible and will remove it from history.`,
+                async () => {
+                    try {
+                        await deleteDoc(doc(getOrdersCollection(), orderId));
+                        await logActivity("Order Deleted (Superuser)", { deletedOrderId: orderId });
+                        showToast("Order deleted.");
+                    } catch (error) {
+                        console.error("Delete order error:", error);
+                        showToast("Could not delete order.", true);
+                    }
+                }
+            );
+        }
+        
+        async function handleDeleteItem(itemId, name) {
+            showConfirmationModal(
+                "Delete Inventory Item?",
+                `Superuser: Delete "${name}" permanently? This is irreversible and will remove it from inventory.`,
+                async () => {
+                    try {
+                        await deleteDoc(doc(getInventoryCollection(), itemId));
+                        await logActivity("Inventory Item Deleted (Superuser)", { deletedItemId: itemId, name: name });
+                        showToast("Item deleted.");
+                    } catch (error) {
+                        console.error("Delete item error:", error);
+                        showToast("Could not delete item.", true);
+                    }
+                }
+            );
+        }
+
         
         // --- 7. EVENT LISTENERS ---
         function setupStaticEventListeners() {
@@ -1179,7 +1650,6 @@
                     if (page) showUserPage(page);
                 });
             });
-            
             document.getElementById('go-to-checkout-btn').addEventListener('click', () => showUserPage('user-checkout-page'));
 
             // Manager Nav
@@ -1190,6 +1660,12 @@
                 });
             });
             
+            // Dashboard quick actions
+            document.getElementById('dash-view-all-pending').addEventListener('click', () => showManagerTab('user-mgt-tab'));
+            document.getElementById('dash-view-all-low').addEventListener('click', () => showManagerTab('inventory-mgt-tab'));
+            document.getElementById('dash-view-all-logs').addEventListener('click', () => showManagerTab('activity-log-tab'));
+            
+            // Other Listeners
             document.querySelector('button[onclick="handleAddInventoryItem()"]').addEventListener('click', handleAddInventoryItem);
             document.getElementById('confirm-order-btn').addEventListener('click', handleSubmitOrder);
             document.getElementById('copy-summary-btn').addEventListener('click', handleCopySummary);
@@ -1199,6 +1675,10 @@
             document.getElementById('register-form').addEventListener('submit', (e) => { e.preventDefault(); handleRegister(); });
             document.getElementById('toggle-to-register').addEventListener('click', (e) => { e.preventDefault(); toggleAuthForms(true); });
             document.getElementById('toggle-to-login').addEventListener('click', (e) => { e.preventDefault(); toggleAuthForms(false); });
+            
+            // Modal Listeners
+            document.getElementById('modal-cancel-btn').addEventListener('click', closeConfirmationModal);
+            document.getElementById('modal-stock-cancel-btn').addEventListener('click', closeAddStockModal);
         }
 
         // --- 8. GLOBAL EXPORTS & INITIALIZATION ---
@@ -1206,8 +1686,16 @@
         window.handleAddToCart = handleAddToCart;
         window.handleUpdateCartQuantity = handleUpdateCartQuantity;
         window.handleRemoveFromCart = handleRemoveFromCart;
-        window.handleUpdateInventoryItem = handleUpdateInventoryItem;
+        window.handleUpdateItemThreshold = handleUpdateItemThreshold;
         window.handleUpdateUserRole = handleUpdateUserRole;
+        window.handleApproveUser = handleApproveUser;
+        window.handleSuspendUser = handleSuspendUser;
+        window.handleDeleteUser = handleDeleteUser;
+        window.handleOpenAddStockModal = handleOpenAddStockModal;
+        window.handleEditItemName = handleEditItemName;
+        window.handleDeleteLog = handleDeleteLog;
+        window.handleDeleteOrder = handleDeleteOrder;
+        window.handleDeleteItem = handleDeleteItem;
         window.handleLogout = handleLogout;
         window.showUserPage = showUserPage;
         window.showManagerTab = showManagerTab;
@@ -1221,7 +1709,7 @@
 
     <!-- Custom Styles -->
     <style>
-        #app-container, #login-view, #profile-setup-view {
+        #app-container, #login-view, #profile-setup-view, #pending-view, #suspended-view {
             animation: fadeIn 0.5s ease-in-out;
         }
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
@@ -1236,7 +1724,6 @@
         }
         @keyframes spin { to { transform: rotate(360deg); } }
         
-        /* Add some extra style for icons */
         .icon-cart::before { content: '🛒'; margin-right: 8px; }
         .icon-shop::before { content: '🛍️'; margin-right: 8px; }
         .icon-orders::before { content: '🧾'; margin-right: 8px; }
@@ -1244,7 +1731,12 @@
         .icon-dashboard::before { content: '📊'; margin-right: 8px; }
         .icon-inventory::before { content: '📦'; margin-right: 8px; }
         .icon-users::before { content: '👥'; margin-right: 8px; }
+        .icon-log::before { content: 'L'; margin-right: 8px; font-weight: bold; font-family: monospace; }
         
+        /* Modal Backdrop */
+        .modal-backdrop {
+            background-color: rgba(0, 0, 0, 0.5);
+        }
     </style>
 </head>
 
@@ -1313,6 +1805,29 @@
     <div id="profile-setup-view" class="hidden flex-grow flex items-center justify-center p-4">
         <!-- JS will render the profile form here -->
     </div>
+    
+    <!-- Pending Approval View -->
+    <div id="pending-view" class="hidden flex-grow flex items-center justify-center p-4 text-center">
+        <div class="bg-white p-8 rounded-xl shadow-xl max-w-lg">
+            <h1 class="text-2xl font-bold text-gray-800 mb-4">Account Pending Approval</h1>
+            <p class="text-gray-600 mb-6">Your profile is complete, but a manager still needs to approve your account before you can access the store. Please check back later.</p>
+            <button onclick="handleLogout()" class="mt-2 text-sm text-red-500 hover:underline">
+                Logout
+            </button>
+        </div>
+    </div>
+    
+    <!-- Suspended View -->
+    <div id="suspended-view" class="hidden flex-grow flex items-center justify-center p-4 text-center">
+        <div class="bg-white p-8 rounded-xl shadow-xl max-w-lg">
+            <h1 class="text-2xl font-bold text-red-600 mb-4">Account Suspended</h1>
+            <p class="text-gray-600 mb-6">Your account has been suspended. Please contact a manager for more information.</p>
+            <button onclick="handleLogout()" class="mt-2 text-sm text-red-500 hover:underline">
+                Logout
+            </button>
+        </div>
+    </div>
+
 
     <!-- Main App Container -->
     <div id="app-container" class="hidden flex-grow max-w-5xl mx-auto p-4 md:p-6 w-full">
@@ -1365,6 +1880,9 @@
             <button data-tab="user-mgt-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-users">
                 User Mgt
             </button>
+             <button data-tab="activity-log-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-log">
+                Activity Log
+            </button>
             <button data-tab="user-profile-page" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-profile">
                 My Profile
             </button>
@@ -1401,18 +1919,13 @@
                 <h2 class="text-2xl font-semibold mb-4">Checkout</h2>
                 <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
                     <h3 class="text-xl font-semibold mb-4">1. Order Details</h3>
-                    <div id="checkout-items-list" class="space-y-6 mb-6">
-                        <!-- JS will render cart items with forms here -->
-                    </div>
-                    
+                    <div id="checkout-items-list" class="space-y-6 mb-6"></div>
                     <h3 class="text-xl font-semibold mb-4">2. Supervision</h3>
                     <div>
                         <label for="supervisor-name" class="block text-sm font-medium text-gray-700">Withdrawal Under Supervision Of:</label>
                         <input type="text" id="supervisor-name" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm" placeholder="Enter full name of security/supervisor">
                     </div>
-                    
                     <hr class="my-6">
-                    
                     <button id="confirm-order-btn" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 shadow-md">
                         Confirm Order
                     </button>
@@ -1422,9 +1935,7 @@
             <!-- User Page: Order History -->
             <div id="user-orders-page" class="hidden">
                 <h2 class="text-2xl font-semibold mb-4">My Order History</h2>
-                <div id="user-orders-list" class="space-y-4">
-                    <!-- JS renders user's orders -->
-                </div>
+                <div id="user-orders-list" class="space-y-4"></div>
             </div>
             
             <!-- User Page: Order Summary -->
@@ -1437,12 +1948,9 @@
                             Copy Summary
                         </button>
                     </div>
-                    <div id="order-summary-details">
-                        <!-- JS renders order details -->
-                    </div>
+                    <div id="order-summary-details"></div>
                 </div>
             </div>
-            
         </main>
 
         <!-- ================================== -->
@@ -1452,12 +1960,57 @@
             <!-- Manager Tab: Dashboard -->
             <div id="dashboard-tab">
                 <h2 class="text-2xl font-semibold mb-4">Manager Dashboard</h2>
-                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
-                    <h3 class="text-xl font-semibold mb-2 text-gray-800">Inventory Summary</h3>
-                    <p class="text-gray-700">Total unique items: <span id="dashboard-summary-total" class="font-bold text-blue-600 text-lg">0</span></p>
+                
+                <!-- KPIs -->
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                    <div class="bg-white p-4 rounded-xl shadow-lg text-center">
+                        <h3 class="text-sm font-medium text-gray-500">Pending Users</h3>
+                        <p id="kpi-pending-users" class="text-3xl font-bold text-gray-800">0</p>
+                    </div>
+                    <div class="bg-white p-4 rounded-xl shadow-lg text-center">
+                        <h3 class="text-sm font-medium text-gray-500">Low Stock Items</h3>
+                        <p id="kpi-low-stock" class="text-3xl font-bold text-gray-800">0</p>
+                    </div>
+                    <div class="bg-white p-4 rounded-xl shadow-lg text-center">
+                        <h3 class="text-sm font-medium text-gray-500">Total Item Types</h3>
+                        <p id="kpi-total-items" class="text-3xl font-bold text-gray-800">0</p>
+                    </div>
+                </div>
+                
+                <!-- NEW INTERACTIVE DASHBOARD -->
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <!-- Pending Users -->
+                    <div class="lg:col-span-1 bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                        <h3 class="text-xl font-semibold mb-4 text-gray-800">Pending Approvals</h3>
+                        <div id="dashboard-pending-list" class="space-y-3 max-h-64 overflow-y-auto">
+                            <!-- JS renders pending users here -->
+                        </div>
+                        <button id="dash-view-all-pending" class="w-full mt-4 bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300">
+                            View All Users
+                        </button>
+                    </div>
                     
-                    <h3 class="text-xl font-semibold mt-6 mb-4 text-red-600">Low Stock Alert</h3>
-                    <ul id="low-stock-list" class="space-y-3"></ul>
+                    <!-- Low Stock -->
+                    <div class="lg:col-span-1 bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                        <h3 class="text-xl font-semibold mb-4 text-gray-800">Low Stock Items</h3>
+                        <div id="dashboard-low-stock-list" class="space-y-3 max-h-64 overflow-y-auto">
+                            <!-- JS renders low stock items here -->
+                        </div>
+                        <button id="dash-view-all-low" class="w-full mt-4 bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300">
+                            View All Inventory
+                        </button>
+                    </div>
+                    
+                    <!-- Recent Activity -->
+                    <div class="lg:col-span-1 bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                        <h3 class="text-xl font-semibold mb-4 text-gray-800">Recent Activity</h3>
+                        <div id="dashboard-recent-activity" class="space-y-2 max-h-64 overflow-y-auto">
+                            <!-- JS renders activity here -->
+                        </div>
+                        <button id="dash-view-all-logs" class="w-full mt-4 bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300">
+                            View Full Log
+                        </button>
+                    </div>
                 </div>
             </div>
 
@@ -1474,7 +2027,7 @@
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
                         <input type="number" id="item-low-stock" placeholder="Low Stock Threshold" value="5" class="p-3 border rounded-lg">
                         <button onclick="handleAddInventoryItem()" class="col-span-1 md:col-span-2 bg-green-500 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-600 shadow-md">
-                            Add Item
+                            Add New Item
                         </button>
                     </div>
                 </div>
@@ -1489,9 +2042,7 @@
             <!-- Manager Tab: Order History -->
             <div id="manager-orders-tab" class="hidden">
                 <h2 class="text-2xl font-semibold mb-4">All Order History</h2>
-                <div id="manager-orders-list" class="space-y-4">
-                    <!-- JS renders all orders -->
-                </div>
+                <div id="manager-orders-list" class="space-y-4"></div>
             </div>
             
             <!-- Manager Tab: User Management -->
@@ -1499,6 +2050,14 @@
                 <h2 class="text-2xl font-semibold mb-4">User Role Management</h2>
                 <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
                     <div id="user-roles-list" class="space-y-4"></div>
+                </div>
+            </div>
+            
+             <!-- Manager Tab: Activity Log -->
+            <div id="activity-log-tab" class="hidden">
+                <h2 class="text-2xl font-semibold mb-4">Activity Log (Ledger)</h2>
+                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                    <div id="activity-log-list" class="space-y-3 max-h-[800px] overflow-y-auto"></div>
                 </div>
             </div>
             
@@ -1519,6 +2078,43 @@
     <!-- Toast Notification -->
     <div id="toast-message" class="hidden opacity-0 fixed top-5 right-5 z-50 bg-green-600 text-white py-3 px-6 rounded-lg shadow-xl transition-all duration-500">
         <!-- Message set by JS -->
+    </div>
+    
+    <!-- Confirmation Modal -->
+    <div id="confirmation-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop">
+        <div class="bg-white rounded-xl shadow-2xl p-6 max-w-sm w-full">
+            <h2 id="modal-title" class="text-xl font-bold text-gray-900 mb-4">Are you sure?</h2>
+            <p id="modal-message" class="text-gray-600 mb-6">This action cannot be undone.</p>
+            <div class="flex justify-end gap-3">
+                <button id="modal-cancel-btn" class="bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300">
+                    Cancel
+                </button>
+                <button id="modal-confirm-btn" class="bg-red-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-red-700">
+                    Confirm
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Add Stock Modal -->
+    <div id="add-stock-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop">
+        <div class="bg-white rounded-xl shadow-2xl p-6 max-w-sm w-full">
+            <h2 class="text-xl font-bold text-gray-900 mb-4">Add Stock</h2>
+            <p class="text-gray-600 mb-2">Item: <span id="modal-stock-item-name" class="font-semibold"></span></p>
+            <p class="text-gray-600 mb-4">Current Stock: <span id="modal-stock-current" class="font-semibold"></span></p>
+            <div>
+                <label for="modal-stock-add-qty" class="block text-sm font-medium text-gray-700">Quantity to Add:</label>
+                <input type="number" id="modal-stock-add-qty" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm">
+            </div>
+            <div class="flex justify-end gap-3 mt-6">
+                <button id="modal-stock-cancel-btn" class="bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300">
+                    Cancel
+                </button>
+                <button id="modal-stock-confirm-btn" class="bg-blue-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-700">
+                    Add
+                </button>
+            </div>
+        </div>
     </div>
 
 </body>
