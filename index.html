@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hubli - StoreInsights</title>
+    <title>STORE-SIGHT</title>
     <!-- 1. Tailwind CSS for styling -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- 2. Firebase SDK (ES Module) -->
@@ -42,18 +42,19 @@
         let db, auth;
         let currentUserId, currentUserEmail, currentUserRole;
         let currentUserProfile = null;
-        let lastOrderCache = null;
+        let lastRequestCache = null;
         
         // Data Caches
         let inventoryCache = [];
-        let localCartCache = [];
+        let localRequestCache = []; // Renamed from localCartCache
         let userRolesCache = []; // Cache for dashboard
 
         // Listeners
+        let unsubscribePublicInventory = () => {};
         let unsubscribeInventory = () => {};
-        let unsubscribeCart = () => {};
-        let unsubscribeUserOrders = () => {};
-        let unsubscribeManagerOrders = () => {};
+        let unsubscribeRequestList = () => {}; // Renamed
+        let unsubscribeUserRequests = () => {}; // Renamed
+        let unsubscribeManagerRequests = () => {}; // Renamed
         let unsubscribeUserRoles = () => {};
         let unsubscribeActivityLog = () => {};
         let unsubscribeDashboardLogs = () => {};
@@ -76,9 +77,9 @@
         // --- DATABASE PATHS ---
         const getInventoryCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'inventory');
         const getUserRolesCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'user_roles');
-        const getOrdersCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'orders');
+        const getRequestsCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'orders'); // "orders" collection in DB
         const getActivityLogCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'activity_log');
-        const getUserCartCollection = (userId) => collection(db, 'artifacts', appId, 'users', userId, 'cart');
+        const getUserRequestListCollection = (userId) => collection(db, 'artifacts', appId, 'users', userId, 'cart'); // "cart" collection in DB
         
         // Helper function for logging all actions
         async function logActivity(action, details = {}) {
@@ -102,18 +103,57 @@
                 const app = initializeApp(firebaseConfig);
                 auth = getAuth(app);
                 db = getFirestore(app);
-                setLogLevel('Debug');
+                setLogLevel('Error'); // Keep console clean
+                
+                // Start public listener *before* auth
+                setupPublicInventoryListener(); 
+                
                 setupAuthListener();
             } catch (error) {
                 console.error("Firebase Init Error:", error);
-                showAuthError("Error connecting to services. Please refresh.");
+                const publicError = document.getElementById('public-inventory-error');
+                if (publicError) {
+                    publicError.textContent = "Error connecting to inventory services. Please refresh.";
+                    publicError.classList.remove('hidden');
+                }
             }
+        }
+        
+        // --- NEW PUBLIC LISTENER ---
+        function setupPublicInventoryListener() {
+            const inventoryQuery = query(getInventoryCollection(), orderBy('name'));
+            unsubscribePublicInventory = onSnapshot(inventoryQuery, (snapshot) => {
+                const publicInventory = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderPublicInventory(publicInventory);
+                
+                // Find the most recent update time
+                let lastUpdate = null;
+                publicInventory.forEach(item => {
+                    const addTime = item.lastAddition?.date?.toDate();
+                    const withdrawTime = item.lastWithdrawal?.date?.toDate();
+                    if (addTime && (!lastUpdate || addTime > lastUpdate)) lastUpdate = addTime;
+                    if (withdrawTime && (!lastUpdate || withdrawTime > lastUpdate)) lastUpdate = withdrawTime;
+                });
+                
+                const updateEl = document.getElementById('last-update-time');
+                if (updateEl) {
+                    updateEl.textContent = lastUpdate ? `Last inventory update: ${lastUpdate.toLocaleString()}` : `Inventory up-to-date.`;
+                }
+
+            }, (error) => {
+                console.error("Public inventory listener error:", error);
+                const publicError = document.getElementById('public-inventory-error');
+                if (publicError) {
+                    publicError.textContent = "Could not load inventory. Check connection or contact admin.";
+                    publicError.classList.remove('hidden');
+                }
+            });
         }
 
         // --- 2. AUTHENTICATION & PROFILE ---
         function setupAuthListener() {
             onAuthStateChanged(auth, async (user) => {
-                unsubscribeAll();
+                unsubscribeAll(); // Unsubscribe auth-only listeners
                 if (user) {
                     currentUserId = user.uid;
                     currentUserEmail = user.email;
@@ -123,7 +163,7 @@
                     currentUserEmail = null;
                     currentUserRole = null;
                     currentUserProfile = null;
-                    showView('login-view');
+                    showView('public-view'); // Default to public view on logout
                 }
             });
         }
@@ -178,12 +218,10 @@
 
                 // Fallback (shouldn't be reached)
                 console.warn("Unhandled user state:", currentUserProfile);
-                showView('login-view');
+                showView('public-view');
                 
             } else {
                 // New user: Create a default 'user' role, force profile setup, and set status to 'pending'
-                
-                // --- NEW: Extract Employee ID from the dummy email ---
                 const emailEmpId = user.email.split('@')[0].split('-')[1] || null;
 
                 currentUserRole = 'user';
@@ -194,7 +232,7 @@
                     userId: userId,
                     email: user.email,
                     name: "", 
-                    empId: emailEmpId, // --- NEW: Save the Employee ID
+                    empId: emailEmpId, // Save the Employee ID
                     designation: ""
                 });
                 await logActivity("User Registered", { email: user.email, empId: emailEmpId });
@@ -226,12 +264,9 @@
                     await logActivity("Profile Completed", { name: name });
                 }
 
-                // Update local profile
                 currentUserProfile = { ...currentUserProfile, name, empId, designation };
                 showToast("Profile updated successfully!");
                 
-                // Re-run check. This will now see the completed profile
-                // and route to the 'pending-view' screen.
                 await checkUserRoleAndProfile(auth.currentUser);
 
             } catch (error) {
@@ -253,9 +288,11 @@
                 return;
             }
 
-            // --- NEW: Convert to Email/Password ---
+            // --- FIX FOR 6-CHAR PASSWORD ---
+            // user-12345@hubli-store.app
             const email = `user-${empId}@hubli-store.app`;
-            const password = `PIN-${pin}`; // Add prefix to meet 6-char requirement
+            // PIN-1234
+            const password = `PIN-${pin}`; // Add prefix
             
             try {
                 showAuthLoading(true);
@@ -278,9 +315,9 @@
                 return;
             }
             
-            // --- NEW: Convert to Email/Password ---
+            // --- FIX FOR 6-CHAR PASSWORD ---
             const email = `user-${empId}@hubli-store.app`;
-            const password = `PIN-${pin}`; // Add prefix to match registration
+            const password = `PIN-${pin}`; // Add prefix
 
             try {
                 showAuthLoading(true);
@@ -296,6 +333,7 @@
 
         async function handleLogout() {
             await signOut(auth);
+            // Auth listener will automatically route to public-view
         }
         
         function getFriendlyAuthError(error) {
@@ -305,14 +343,14 @@
                 case 'auth/wrong-password':
                 case 'auth/invalid-credential': return 'Invalid Employee ID or PIN.';
                 case 'auth/email-already-in-use': return 'This Employee ID is already registered.';
-                case 'auth/weak-password': return 'PIN must be at least 4 digits.'; // Should be caught by form validation
+                case 'auth/weak-password': return 'PIN must be at least 4 digits.';
                 default: return 'An error occurred. Please try again.';
             }
         }
 
         // --- 3. UI & VIEW MANAGEMENT ---
         function showView(viewId) {
-            ['loading-view', 'login-view', 'app-container', 'profile-setup-view', 'pending-view', 'suspended-view'].forEach(id => {
+            ['loading-view', 'public-view', 'login-view', 'app-container', 'profile-setup-view', 'pending-view', 'suspended-view'].forEach(id => {
                 document.getElementById(id).classList.add('hidden');
             });
             document.getElementById(viewId).classList.remove('hidden');
@@ -342,37 +380,42 @@
         function setupUIForRole(role) {
             const isManagerOrSuper = (role === 'manager' || role === 'superuser');
             
+            // Hide all main interfaces first
+            document.getElementById('user-interface').classList.add('hidden');
+            document.getElementById('manager-interface').classList.add('hidden');
+            document.getElementById('request-summary-page').classList.add('hidden');
+            document.getElementById('user-profile-page').classList.add('hidden');
+
             if (isManagerOrSuper) {
-                document.getElementById('user-interface').classList.add('hidden');
                 document.getElementById('manager-interface').classList.remove('hidden');
                 document.getElementById('manager-nav').classList.remove('hidden');
                 document.getElementById('user-nav').classList.add('hidden');
                 showManagerTab('dashboard-tab');
             } else {
                 document.getElementById('user-interface').classList.remove('hidden');
-                document.getElementById('manager-interface').classList.add('hidden');
                 document.getElementById('manager-nav').classList.add('hidden');
                 document.getElementById('user-nav').classList.remove('hidden');
                 showUserPage('user-inventory-page');
             }
-            // Reset common pages
-            document.getElementById('user-profile-page').classList.add('hidden');
         }
         
         function showUserPage(pageId) {
-            ['user-inventory-page', 'user-cart-page', 'user-checkout-page', 'user-orders-page', 'order-summary-page', 'user-profile-page'].forEach(id => {
+            // Hide all user pages
+            ['user-inventory-page', 'user-request-page', 'user-checkout-page', 'user-requests-page', 'user-profile-page'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.classList.add('hidden');
             });
+            // Show the target user page
             const targetEl = document.getElementById(pageId);
             if (targetEl) targetEl.classList.remove('hidden');
             
+            // Set active tab style
             document.querySelectorAll('#user-nav button').forEach(btn => {
                 if (btn.getAttribute('data-page') === pageId) {
-                    btn.classList.add('bg-blue-100', 'text-blue-700', 'shadow-inner');
+                    btn.classList.add('bg-red-100', 'text-red-700');
                     btn.classList.remove('text-gray-700', 'hover:bg-gray-100');
                 } else {
-                    btn.classList.remove('bg-blue-100', 'text-blue-700', 'shadow-inner');
+                    btn.classList.remove('bg-red-100', 'text-red-700');
                     btn.classList.add('text-gray-700', 'hover:bg-gray-100');
                 }
             });
@@ -382,23 +425,26 @@
         }
 
         function showManagerTab(tabId) {
-            ['dashboard-tab', 'inventory-mgt-tab', 'user-mgt-tab', 'manager-orders-tab', 'activity-log-tab', 'user-profile-page'].forEach(id => {
+            // Hide all manager tabs
+            ['dashboard-tab', 'inventory-mgt-tab', 'user-mgt-tab', 'manager-requests-tab', 'activity-log-tab', 'user-profile-page'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.classList.add('hidden');
             });
+            // Also hide the summary page when changing tabs
+            document.getElementById('request-summary-page').classList.add('hidden');
             
+            // Set active tab style
             document.querySelectorAll('#manager-nav button').forEach(btn => {
                 if (btn.getAttribute('data-tab') === tabId) {
-                    btn.classList.replace('bg-gray-700', 'bg-blue-700');
-                    btn.classList.add('shadow-lg', 'ring-2', 'ring-blue-300');
-                    btn.classList.remove('hover:bg-blue-600');
+                    btn.classList.replace('bg-gray-700', 'bg-red-700');
+                    btn.classList.remove('hover:bg-red-600');
                 } else {
-                    btn.classList.replace('bg-blue-700', 'bg-gray-700');
-                    btn.classList.add('hover:bg-blue-600');
-                    btn.classList.remove('shadow-lg', 'ring-2', 'ring-blue-300');
+                    btn.classList.replace('bg-red-700', 'bg-gray-700');
+                    btn.classList.add('hover:bg-red-600');
                 }
             });
             
+            // Show the target manager tab
             const targetTab = document.getElementById(tabId);
             if (targetTab) targetTab.classList.remove('hidden');
 
@@ -423,7 +469,6 @@
             document.getElementById('modal-title').textContent = title;
             document.getElementById('modal-message').textContent = message;
             
-            // Clone and replace the confirm button to remove old listeners
             const confirmBtn = document.getElementById('modal-confirm-btn');
             const newConfirmBtn = confirmBtn.cloneNode(true);
             confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
@@ -439,20 +484,24 @@
         function closeConfirmationModal() {
             document.getElementById('confirmation-modal').classList.add('hidden');
         }
+        
+        function closeItemHistoryModal() {
+            document.getElementById('item-history-modal').classList.add('hidden');
+        }
 
 
         // --- 4. DATA LISTENERS ---
         function attachDataListeners(role, userId) {
             const isManagerOrSuper = (role === 'manager' || role === 'superuser');
             
-            // 1. Listen to Inventory (all users)
+            // 1. Listen to Inventory (all auth'd users)
             const inventoryQuery = query(getInventoryCollection(), orderBy('name'));
             unsubscribeInventory = onSnapshot(inventoryQuery, (snapshot) => {
                 inventoryCache = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                 
                 if (role === 'user') {
                     renderUserInventory(inventoryCache);
-                    renderUserCart(localCartCache, inventoryCache); // Re-render cart with fresh names
+                    renderUserRequestList(localRequestCache, inventoryCache); // Re-render list with fresh names
                 }
                 if (isManagerOrSuper) {
                     renderManagerInventory(inventoryCache);
@@ -462,25 +511,33 @@
                 }
             }, (error) => console.error("Inventory listener error:", error));
 
-            // 2. Listen to User Cart (only for regular users)
+            // 2. Listen to User Request List (only for regular users)
             if (role === 'user') {
-                const cartQuery = query(getUserCartCollection(userId));
-                unsubscribeCart = onSnapshot(cartQuery, (snapshot) => {
-                    localCartCache = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    renderUserCart(localCartCache, inventoryCache);
-                }, (error) => console.error("Cart listener error:", error));
+                const requestListQuery = query(getUserRequestListCollection(userId));
+                unsubscribeRequestList = onSnapshot(requestListQuery, (snapshot) => {
+                    localRequestCache = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    renderUserRequestList(localRequestCache, inventoryCache);
+                }, (error) => console.error("Request list listener error:", error));
             }
             
-            // 3. Listen to User Orders (only for regular users)
+            // 3. Listen to User Requests (only for regular users)
             if (role === 'user') {
-                const userOrdersQuery = query(getOrdersCollection(), where('userId', '==', userId), orderBy('createdAt', 'desc'));
-                unsubscribeUserOrders = onSnapshot(userOrdersQuery, (snapshot) => {
-                    const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    renderUserOrders(orders);
-                }, (error) => console.error("User orders listener error:", error));
+                const userRequestsQuery = query(getRequestsCollection(), where('userId', '==', userId), orderBy('createdAt', 'desc'));
+                unsubscribeUserRequests = onSnapshot(userRequestsQuery, (snapshot) => {
+                    const requests = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    renderUserRequests(requests);
+                }, (error) => {
+                    console.error("User requests listener error:", error);
+                    // --- BUGFIX: Show error in UI if index is missing ---
+                    const list = document.getElementById('user-requests-list');
+                    if (list) {
+                        list.innerHTML = `<p class="text-red-600 font-medium">Error loading history. The database may be missing a required index. Please contact your administrator.</p>
+                        <p class="text-sm text-gray-600">Admin: See Step 6 in the setup guide to create the 'orders' index.</p>`;
+                    }
+                });
             }
 
-            // 4. Listen to User Roles, All Orders, Activity Log (only for managers/supers)
+            // 4. Listen to User Roles, All Requests, Activity Log (only for managers/supers)
             if (isManagerOrSuper) {
                 // User Roles
                 const usersQuery = query(getUserRolesCollection(), orderBy('created', 'desc'));
@@ -492,12 +549,12 @@
                     }
                 }, (error) => console.error("User roles listener error:", error));
                 
-                // All Orders
-                const allOrdersQuery = query(getOrdersCollection(), orderBy('createdAt', 'desc'));
-                unsubscribeManagerOrders = onSnapshot(allOrdersQuery, (snapshot) => {
-                    const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    renderManagerOrders(orders);
-                }, (error) => console.error("Manager orders listener error:", error));
+                // All Requests
+                const allRequestsQuery = query(getRequestsCollection(), orderBy('createdAt', 'desc'));
+                unsubscribeManagerRequests = onSnapshot(allRequestsQuery, (snapshot) => {
+                    const requests = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    renderManagerRequests(requests);
+                }, (error) => console.error("Manager requests listener error:", error));
                 
                 // Full Activity Log
                 const logQuery = query(getActivityLogCollection(), orderBy('timestamp', 'desc'), limit(50));
@@ -518,35 +575,35 @@
 
         function unsubscribeAll() {
             unsubscribeInventory();
-            unsubscribeCart();
-            unsubscribeUserOrders();
-            unsubscribeManagerOrders();
+            unsubscribeRequestList();
+            unsubscribeUserRequests();
+            unsubscribeManagerRequests();
             unsubscribeUserRoles();
             unsubscribeActivityLog();
             unsubscribeDashboardLogs();
         }
 
         // --- 5. REGULAR USER: ACTIONS & RENDERING ---
-        async function handleAddToCart(itemId, itemName, maxStock) {
+        async function handleAddToRequest(itemId, itemName, maxStock) { // Renamed
             if (maxStock <= 0) {
                 showToast("Item is out of stock.", true);
                 return;
             }
             
-            const cartItemRef = doc(getUserCartCollection(currentUserId), itemId);
+            const requestItemRef = doc(getUserRequestListCollection(currentUserId), itemId);
             
             try {
                 await runTransaction(db, async (transaction) => {
-                    const cartItemDoc = await transaction.get(cartItemRef);
+                    const requestItemDoc = await transaction.get(requestItemRef);
                     
-                    if (cartItemDoc.exists()) {
-                        const newQuantity = cartItemDoc.data().quantity + 1;
+                    if (requestItemDoc.exists()) {
+                        const newQuantity = requestItemDoc.data().quantity + 1;
                         if (newQuantity > maxStock) {
                             throw new Error("Cannot add more than available stock.");
                         }
-                        transaction.update(cartItemRef, { quantity: newQuantity });
+                        transaction.update(requestItemRef, { quantity: newQuantity });
                     } else {
-                        transaction.set(cartItemRef, {
+                        transaction.set(requestItemRef, {
                             productId: itemId,
                             productName: itemName,
                             quantity: 1,
@@ -554,37 +611,37 @@
                         });
                     }
                 });
-                showToast("Item added to cart!");
+                showToast("Item added to request list!");
             } catch (error) {
-                console.error("Add to cart error:", error.message);
-                showToast(error.message || "Could not add item to cart.", true);
+                console.error("Add to list error:", error.message);
+                showToast(error.message || "Could not add item.", true);
             }
         }
 
-        async function handleUpdateCartQuantity(itemId, newQuantity) {
-            const cartItemRef = doc(getUserCartCollection(currentUserId), itemId);
+        async function handleUpdateRequestQuantity(itemId, newQuantity) { // Renamed
+            const requestItemRef = doc(getUserRequestListCollection(currentUserId), itemId);
             if (newQuantity <= 0) {
-                await deleteDoc(cartItemRef);
-                showToast("Item removed from cart.");
+                await deleteDoc(requestItemRef);
+                showToast("Item removed from list.");
             } else {
                 const inventoryItem = inventoryCache.find(item => item.id === itemId);
                 if (inventoryItem && newQuantity > inventoryItem.stock) {
                     showToast("Cannot add more than available stock.", true);
                 } else {
-                    await updateDoc(cartItemRef, { quantity: newQuantity });
-                    showToast("Cart updated.");
+                    await updateDoc(requestItemRef, { quantity: newQuantity });
+                    showToast("List updated.");
                 }
             }
         }
 
-        async function handleRemoveFromCart(itemId) {
-            const cartItemRef = doc(getUserCartCollection(currentUserId), itemId);
-            await deleteDoc(cartItemRef);
-            showToast("Item removed from cart.");
+        async function handleRemoveFromRequest(itemId) { // Renamed
+            const requestItemRef = doc(getUserRequestListCollection(currentUserId), itemId);
+            await deleteDoc(requestItemRef);
+            showToast("Item removed from list.");
         }
 
-        async function handleSubmitOrder() {
-            const checkoutButton = document.getElementById('confirm-order-btn');
+        async function handleSubmitRequest() { // Renamed
+            const checkoutButton = document.getElementById('confirm-request-btn');
             checkoutButton.disabled = true;
             checkoutButton.textContent = "Submitting...";
 
@@ -592,29 +649,29 @@
             if (!supervisorName) {
                 showToast("Please enter the supervisor's name.", true);
                 checkoutButton.disabled = false;
-                checkoutButton.textContent = "Confirm Order";
+                checkoutButton.textContent = "Confirm Request";
                 return;
             }
             
-            let newOrderData;
-            let orderId;
+            let newRequestData;
+            let requestId;
 
             try {
                 // --- ATOMIC TRANSACTION ---
                 await runTransaction(db, async (transaction) => {
                     // --- 1. READ PHASE ---
                     
-                    // 1a. Read all cart items
-                    const cartSnapshot = await getDocs(query(getUserCartCollection(currentUserId)));
-                    const cartItems = cartSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    // 1a. Read all request list items
+                    const listSnapshot = await getDocs(query(getUserRequestListCollection(currentUserId)));
+                    const listItems = listSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     
-                    if (cartItems.length === 0) {
-                        throw new Error("Your cart is empty. Please add items before checking out.");
+                    if (listItems.length === 0) {
+                        throw new Error("Your request list is empty.");
                     }
 
-                    // 1b. Read all inventory items in the cart
+                    // 1b. Read all inventory items in the list
                     const inventoryDocs = new Map();
-                    const readPromises = cartItems.map(item => {
+                    const readPromises = listItems.map(item => {
                         const itemRef = doc(getInventoryCollection(), item.productId);
                         return transaction.get(itemRef).then(doc => inventoryDocs.set(item.productId, doc));
                     });
@@ -622,7 +679,7 @@
 
                     // --- 2. VALIDATION PHASE (In-Memory) ---
                     const itemsWithDetails = [];
-                    for (const item of cartItems) {
+                    for (const item of listItems) {
                         const inventoryDoc = inventoryDocs.get(item.productId);
                         if (!inventoryDoc || !inventoryDoc.exists()) {
                             throw new Error(`Item "${item.productName}" is no longer available.`);
@@ -633,30 +690,28 @@
                             throw new Error(`Not enough stock for "${inventoryData.name}". Only ${inventoryData.stock} left.`);
                         }
                         
-                        // Get remarks from the (non-transacted) DOM
                         itemsWithDetails.push({
                             ...item,
-                            // Get simplified data
                             remarks: document.getElementById(`remarks-${item.id}`).value.trim()
                         });
                     }
 
                     // --- 3. WRITE PHASE (All writes at the end) ---
                     
-                    // 3a. Prepare the new order
-                    const newOrderRef = doc(getOrdersCollection()); // Auto-generate ID
-                    orderId = newOrderRef.id; // Store ID for logging
-                    newOrderData = {
+                    // 3a. Prepare the new request
+                    const newRequestRef = doc(getRequestsCollection()); // Auto-generate ID
+                    requestId = newRequestRef.id; // Store ID for logging
+                    newRequestData = {
                         userId: currentUserId,
                         userProfile: currentUserProfile,
                         status: "pending",
                         createdAt: serverTimestamp(),
                         supervisorName: supervisorName,
-                        items: itemsWithDetails // Simplified items
+                        items: itemsWithDetails
                     };
                     
-                    // 3b. Write 1: Create the new order
-                    transaction.set(newOrderRef, newOrderData);
+                    // 3b. Write 1: Create the new request
+                    transaction.set(newRequestRef, newRequestData);
 
                     const withdrawalTime = serverTimestamp();
                     const withdrawalUser = currentUserProfile.name;
@@ -677,37 +732,52 @@
                         });
                     }
                     
-                    // 3d. Write 3: Delete all cart items
-                    for (const cartDoc of cartSnapshot.docs) {
-                        transaction.delete(cartDoc.ref);
+                    // 3d. Write 3: Delete all request list items
+                    for (const listDoc of listSnapshot.docs) {
+                        transaction.delete(listDoc.ref);
                     }
                 });
                 // --- TRANSACTION END ---
 
                 // --- POST-TRANSACTION SUCCESS ---
-                await logActivity("Order Placed", { orderId: orderId, items: newOrderData.items.length });
-                showToast("Order submitted successfully!");
+                await logActivity("Request Placed", { requestId: requestId, items: newRequestData.items.length });
+                showToast("Request submitted successfully!");
                 
-                lastOrderCache = { id: orderId, ...newOrderData }; // Save for summary page
-                renderOrderSummaryPage(lastOrderCache, true); // true = just created
-                showUserPage('order-summary-page');
+                lastRequestCache = { id: requestId, ...newRequestData }; // Save for summary page
+                
+                // --- NEW NAVIGATION ---
+                renderRequestSummaryPage(lastRequestCache, true); // true = just created
+                document.getElementById('user-interface').classList.add('hidden'); // Hide user UI
+                document.getElementById('request-summary-page').classList.remove('hidden'); // Show summary
+                
+                // Add back button
+                document.getElementById('summary-back-btn-container').innerHTML = `
+                    <button id="summary-back-to-shop" class="w-full bg-red-600 text-white font-semibold py-3 px-4 rounded-lg hover:bg-red-700">
+                        Back to Browse
+                    </button>
+                `;
+                document.getElementById('summary-back-to-shop').onclick = () => {
+                    document.getElementById('request-summary-page').classList.add('hidden');
+                    document.getElementById('user-interface').classList.remove('hidden');
+                    showUserPage('user-inventory-page');
+                };
                 
             } catch (error) {
-                console.error("Order submission error: ", error);
-                showToast(error.message || "Failed to submit order.", true);
+                console.error("Request submission error: ", error);
+                showToast(error.message || "Failed to submit request.", true);
             } finally {
                 checkoutButton.disabled = false;
-                checkoutButton.textContent = "Confirm Order";
+                checkoutButton.textContent = "Confirm Request";
             }
         }
         
         async function handleCopySummary() {
-            if (!lastOrderCache) return;
+            if (!lastRequestCache) return;
             
-            const { id, createdAt, supervisorName, userProfile, items } = lastOrderCache;
+            const { id, createdAt, supervisorName, userProfile, items } = lastRequestCache;
             
-            let summaryText = `** Hubli - StoreInsights: Order Summary **\n\n`;
-            summaryText += `Order ID: ${id}\n`;
+            let summaryText = `** STORE-SIGHT: Withdrawal Slip **\n\n`;
+            summaryText += `Request ID: ${id}\n`;
             summaryText += `Date: ${new Date().toLocaleString()}\n`;
             summaryText += `Status: Pending\n\n`;
             
@@ -748,6 +818,35 @@
         }
 
         // --- REGULAR USER: RENDER ---
+        
+        // --- NEW PUBLIC INVENTORY RENDER ---
+        function renderPublicInventory(inventory) {
+            const list = document.getElementById('public-inventory-list');
+            const errorEl = document.getElementById('public-inventory-error');
+            if (!list || !errorEl) return;
+            
+            list.innerHTML = ''; // Clear previous
+            errorEl.classList.add('hidden');
+            
+            if (inventory.length === 0) {
+                list.innerHTML = '<tr><td colspan="3" class="px-4 py-3 text-center text-gray-500">No items in inventory.</td></tr>';
+                return;
+            }
+            
+            inventory.forEach(item => {
+                const inStock = item.stock > 0;
+                list.innerHTML += `
+                    <tr class="border-b border-gray-200">
+                        <td class="px-4 py-3 font-medium text-gray-800">${item.name}</td>
+                        <td class="px-4 py-3 text-gray-700">${item.stock}</td>
+                        <td class="px-4 py-3">
+                            ${inStock ? `<span class="font-medium text-green-700">In Stock</span>` : '<span class="font-medium text-red-600">Out of Stock</span>'}
+                        </td>
+                    </tr>
+                `;
+            });
+        }
+        
         function renderProfilePage(isFirstTime = false) {
             const container = document.getElementById('user-profile-page');
             const setupContainer = document.getElementById('profile-setup-view');
@@ -764,29 +863,29 @@
             const email = currentUserEmail || '';
             
             targetContainer.innerHTML = `
-                <div class="bg-white p-6 md:p-8 rounded-xl shadow-xl max-w-2xl mx-auto">
-                    <h2 class="text-2xl font-semibold mb-5">${title}</h2>
+                <div class="bg-white p-6 md:p-8 rounded-lg max-w-2xl mx-auto border">
+                    <h2 class="text-3xl font-bold mb-5 text-red-800 border-b-2 border-red-200 pb-2">${title}</h2>
                     ${isFirstTime ? '<p class="text-gray-600 mb-6">Please complete your profile to continue. Your account will be pending approval from a manager.</p>' : ''}
                     
                     <div class="space-y-4">
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Login Email (Auto-generated)</label>
-                            <input type="email" value="${email}" disabled class="mt-1 block w-full rounded-lg border-gray-300 bg-gray-100 shadow-sm sm:text-sm">
+                            <input type="email" value="${email}" disabled class="mt-1 block w-full rounded-lg border-gray-300 bg-gray-100 sm:text-sm">
                         </div>
                         <div>
                             <label for="profile-empId" class="block text-sm font-medium text-gray-700">Employee ID</label>
-                            <input type="text" id="profile-empId" value="${empId}" disabled class="mt-1 block w-full rounded-lg border-gray-300 bg-gray-100 shadow-sm sm:text-sm">
+                            <input type="text" id="profile-empId" value="${empId}" disabled class="mt-1 block w-full rounded-lg border-gray-300 bg-gray-100 sm:text-sm">
                         </div>
                         <div>
                             <label for="profile-name" class="block text-sm font-medium text-gray-700">Full Name</label>
-                            <input type="text" id="profile-name" value="${name}" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm">
+                            <input type="text" id="profile-name" value="${name}" class="mt-1 block w-full rounded-lg border-gray-300 focus:border-red-500 focus:ring-2 focus:ring-red-300 sm:text-sm">
                         </div>
                         <div>
                             <label for="profile-designation" class="block text-sm font-medium text-gray-700">Designation</label>
-                            <input type="text" id="profile-designation" value="${designation}" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm">
+                            <input type="text" id="profile-designation" value="${designation}" class="mt-1 block w-full rounded-lg border-gray-300 focus:border-red-500 focus:ring-2 focus:ring-red-300 sm:text-sm">
                         </div>
                         
-                        <button id="update-profile-btn" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 shadow-md">
+                        <button id="update-profile-btn" class="w-full bg-red-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-red-700">
                             ${buttonText}
                         </button>
                     </div>
@@ -808,7 +907,7 @@
             inventory.forEach(item => {
                 const inStock = item.stock > 0;
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-lg flex justify-between items-center">
+                    <div class="bg-white p-4 rounded-lg border flex justify-between items-center">
                         <div>
                             <h3 class="text-lg font-semibold text-gray-800">${item.name}</h3>
                             <p class="text-gray-600">
@@ -816,20 +915,20 @@
                             </p>
                         </div>
                         <button 
-                            onclick="handleAddToCart('${item.id}', '${item.name}', ${item.stock})" 
-                            class="add-to-cart-btn ${inStock ? 'bg-blue-500 hover:bg-blue-600' : 'bg-gray-300 cursor-not-allowed'} text-white font-bold py-2 px-4 rounded-lg shadow-md hover:shadow-lg"
+                            onclick="handleAddToRequest('${item.id}', '${item.name}', ${item.stock})" 
+                            class="add-to-request-btn ${inStock ? 'bg-red-500 hover:bg-red-600' : 'bg-gray-300 cursor-not-allowed'} text-white font-bold py-2 px-4 rounded-lg"
                             ${!inStock ? 'disabled' : ''}
                         >
-                            Add to Cart
+                            Add to List
                         </button>
                     </div>
                 `;
             });
         }
 
-        function renderUserCart(cart, inventory) {
-            const list = document.getElementById('cart-items-list');
-            const totalSpan = document.getElementById('cart-total');
+        function renderUserRequestList(requestList, inventory) { // Renamed
+            const list = document.getElementById('request-items-list');
+            const totalSpan = document.getElementById('request-total');
             const checkoutBtn = document.getElementById('go-to-checkout-btn');
             
             if (!list || !totalSpan || !checkoutBtn) return;
@@ -837,28 +936,28 @@
             list.innerHTML = '';
             let totalItems = 0;
 
-            if (cart.length === 0) {
-                list.innerHTML = '<p class="text-gray-500">Your cart is empty.</p>';
+            if (requestList.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">Your request list is empty.</p>';
                 checkoutBtn.disabled = true;
                 checkoutBtn.classList.add('bg-gray-300', 'cursor-not-allowed');
                 checkoutBtn.classList.remove('bg-green-500', 'hover:bg-green-600');
             } else {
-                cart.forEach(item => {
+                requestList.forEach(item => {
                     totalItems += item.quantity;
                     const inventoryItem = inventory.find(inv => inv.id === item.productId);
                     const currentName = inventoryItem ? inventoryItem.name : item.productName;
                     
                     list.innerHTML += `
-                        <div class="bg-white p-3 rounded-xl shadow-md flex justify-between items-center">
+                        <div class="bg-white p-3 rounded-lg border flex justify-between items-center">
                             <div>
                                 <h4 class="font-semibold text-gray-800">${currentName}</h4>
                                 <div class="flex items-center gap-2 mt-2">
-                                    <button onclick="handleUpdateCartQuantity('${item.id}', ${item.quantity - 1})" class="bg-gray-200 w-7 h-7 rounded-full font-bold text-lg text-gray-700 flex items-center justify-center hover:bg-gray-300">-</button>
+                                    <button onclick="handleUpdateRequestQuantity('${item.id}', ${item.quantity - 1})" class="bg-gray-200 w-7 h-7 rounded-full font-bold text-lg text-gray-700 flex items-center justify-center hover:bg-gray-300">-</button>
                                     <span class="text-lg w-8 text-center">${item.quantity}</span>
-                                    <button onclick="handleUpdateCartQuantity('${item.id}', ${item.quantity + 1})" class="bg-gray-200 w-7 h-7 rounded-full font-bold text-lg text-gray-700 flex items-center justify-center hover:bg-gray-300">+</button>
+                                    <button onclick="handleUpdateRequestQuantity('${item.id}', ${item.quantity + 1})" class="bg-gray-200 w-7 h-7 rounded-full font-bold text-lg text-gray-700 flex items-center justify-center hover:bg-gray-300">+</button>
                                 </div>
                             </div>
-                            <button onclick="handleRemoveFromCart('${item.id}')" class="text-red-500 hover:text-red-700 font-medium">
+                            <button onclick="handleRemoveFromRequest('${item.id}')" class="text-red-500 hover:text-red-700 font-medium">
                                 Remove
                             </button>
                         </div>
@@ -877,22 +976,20 @@
             list.innerHTML = '';
             document.getElementById('supervisor-name').value = '';
             
-            if (localCartCache.length === 0) {
-                 list.innerHTML = '<p class="text-gray-500">Your cart is empty. <a href="#" onclick="showUserPage(\'user-inventory-page\'); return false;" class="text-blue-500">Go shopping</a>.</p>';
-                 document.getElementById('confirm-order-btn').disabled = true;
+            if (localRequestCache.length === 0) {
+                 list.innerHTML = '<p class="text-gray-500">Your list is empty. <a href="#" onclick="showUserPage(\'user-inventory-page\'); return false;" class="text-red-500">Browse items</a>.</p>';
+                 document.getElementById('confirm-request-btn').disabled = true;
                  return;
             }
             
-            document.getElementById('confirm-order-btn').disabled = false;
-            localCartCache.forEach(item => {
+            document.getElementById('confirm-request-btn').disabled = false;
+            localRequestCache.forEach(item => {
                 const inventoryItem = inventoryCache.find(inv => inv.id === item.productId);
                 const currentName = inventoryItem ? inventoryItem.name : item.productName;
                 
-                // --- SIMPLIFIED CHECKOUT ---
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-md space-y-4" id="item-form-${item.id}">
+                    <div class="bg-white p-4 rounded-lg border space-y-4" id="item-form-${item.id}">
                         <h4 class="text-lg font-semibold text-gray-800">${currentName} (Qty: ${item.quantity})</h4>
-                        
                         <div>
                             <label for="remarks-${item.id}" class="block text-sm font-medium text-gray-700">Remarks:</label>
                             <input type="text" id="remarks-${item.id}" class="checkout-remarks-input mt-1 block w-full rounded-lg border-gray-300 sm:text-sm" placeholder="Optional">
@@ -902,82 +999,99 @@
             });
         }
         
-        function renderOrderSummaryPage(order, justCreated) {
-            const list = document.getElementById('order-summary-details');
-            if (!order) {
-                list.innerHTML = '<p class="text-gray-600">Could not find order details.</p>';
+        function renderRequestSummaryPage(request, justCreated) { // Renamed
+            const list = document.getElementById('request-summary-details');
+            const titleEl = document.getElementById('request-summary-title');
+            if (!request || !titleEl) {
+                list.innerHTML = '<p class="text-gray-600">Could not find request details.</p>';
                 return;
             }
             
+            // --- BUGFIX: Set title based on context ---
+            if (justCreated) {
+                titleEl.textContent = 'Request Placed Successfully!';
+                titleEl.className = 'text-2xl font-semibold mb-4 text-green-600';
+            } else {
+                titleEl.textContent = ''; // Title is now on the slip itself
+                titleEl.className = '';
+            }
+            
             document.getElementById('copy-summary-btn').classList.toggle('hidden', !justCreated);
-            const orderDate = order.createdAt?.toDate ? order.createdAt.toDate().toLocaleString() : 'Just now';
+            const requestDate = request.createdAt?.toDate ? request.createdAt.toDate().toLocaleString() : 'Just now';
             
             let itemsHtml = '';
-            order.items.forEach((item, index) => {
+            request.items.forEach((item, index) => {
                 const currentItem = inventoryCache.find(inv => inv.id === item.productId);
                 const currentName = currentItem ? currentItem.name : item.productName;
                 
-                // --- SIMPLIFIED SUMMARY ---
                 itemsHtml += `
-                    <div class="p-4 border border-gray-200 rounded-lg">
-                        <h5 class="font-semibold text-gray-800">${index + 1}. ${currentName} (Qty: ${item.quantity})</h5>
-                        ${item.remarks ? `<p class="text-sm text-gray-600 mt-2">Remarks: ${item.remarks}</p>` : ''}
-                    </div>
+                    <tr class="border-b">
+                        <td class="p-2">${index + 1}</td>
+                        <td class="p-2">${currentName}</td>
+                        <td class="p-2 text-center">${item.quantity}</td>
+                        <td class="p-2">${item.remarks || 'N/A'}</td>
+                    </tr>
                 `;
             });
             
             list.innerHTML = `
-                <div class="space-y-6">
-                    <div>
-                        <h3 class="text-lg font-semibold text-gray-900">Order ID:</h3>
-                        <p class="text-gray-700 text-sm font-mono">${order.id}</p>
+                <div class="space-y-4 font-mono text-sm text-gray-800">
+                    <p><strong>Request ID:</strong> ${request.id}</p>
+                    <p><strong>Date:</strong> ${requestDate}</p>
+                    <hr>
+                    <p><strong>Requested By:</strong></p>
+                    <div class="pl-4">
+                        <p>${request.userProfile.name}</p>
+                        <p>ID: ${request.userProfile.empId}</p>
+                        <p>Designation: ${request.userProfile.designation}</p>
                     </div>
-                    <div>
-                        <h3 class="text-lg font-semibold text-gray-900">Date:</h3>
-                        <p class="text-gray-700">${orderDate}</p>
+                    <hr>
+                    <p><strong>Supervised By:</strong></p>
+                    <div class="pl-4">
+                        <p>${request.supervisorName}</p>
                     </div>
-                    <div>
-                        <h3 class="text-lg font-semibold text-gray-900">Requested By:</h3>
-                        <p class="text-gray-700">${order.userProfile.name} (${order.userProfile.designation})</p>
-                        <p class="text-gray-700">ID: ${order.userProfile.empId}</p>
-                    </div>
-                    <div>
-                        <h3 class="text-lg font-semibold text-gray-900">Supervised By:</h3>
-                        <p class="text-gray-700">${order.supervisorName}</p>
-                    </div>
-                    <div>
-                        <h3 class="text-lg font-semibold text-gray-900">Items (${order.items.length}):</h3>
-                        <div class="space-y-3 mt-2">
+                    <hr>
+                    <p><strong>Items (${request.items.length}):</strong></p>
+                    <table class="w-full border-collapse border mt-2">
+                        <thead class="bg-gray-100">
+                            <tr>
+                                <th class="p-2 border text-left">#</th>
+                                <th class="p-2 border text-left">Item</th>
+                                <th class="p-2 border text-center">Qty</th>
+                                <th class="p-2 border text-left">Remarks</th>
+                            </tr>
+                        </thead>
+                        <tbody>
                             ${itemsHtml}
-                        </div>
-                    </div>
+                        </tbody>
+                    </table>
                 </div>
             `;
         }
         
-        function renderUserOrders(orders) {
-            const list = document.getElementById('user-orders-list');
+        function renderUserRequests(requests) { // Renamed
+            const list = document.getElementById('user-requests-list');
             if (!list) return;
             list.innerHTML = '';
             
-            if (orders.length === 0) {
-                list.innerHTML = '<p class="text-gray-500">You have not placed any orders yet.</p>';
+            if (requests.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">You have not placed any requests yet.</p>';
                 return;
             }
             
-            orders.forEach(order => {
-                const totalItems = order.items.reduce((sum, item) => sum + item.quantity, 0);
-                const orderDate = order.createdAt?.toDate ? order.createdAt.toDate().toLocaleDateString() : 'Pending';
+            requests.forEach(request => {
+                const totalItems = request.items.reduce((sum, item) => sum + item.quantity, 0);
+                const requestDate = request.createdAt?.toDate ? request.createdAt.toDate().toLocaleDateString() : 'Pending';
                 
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-lg">
+                    <div class="bg-white p-4 rounded-lg border">
                         <div class="flex justify-between items-center">
                             <div>
-                                <h3 class="text-lg font-semibold text-gray-800">Order ID: <span class="font-normal text-sm">${order.id}</span></h3>
-                                <p class="text-gray-600">Date: ${orderDate}</p>
+                                <h3 class="text-sm font-semibold text-gray-800 font-mono">ID: ${request.id}</h3>
+                                <p class="text-gray-600">Date: ${requestDate}</p>
                                 <p class="text-gray-600">Total Items: ${totalItems}</p>
                             </div>
-                            <button onclick="viewOrderDetails('${order.id}')" class="bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-600">
+                            <button onclick="viewRequestDetails('${request.id}')" class="bg-red-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-red-600">
                                 View
                             </button>
                         </div>
@@ -985,22 +1099,37 @@
                 `;
             });
             
-            window.viewOrderDetails = async (orderId) => {
-                const orderRef = doc(getOrdersCollection(), orderId);
-                const orderDoc = await getDoc(orderRef);
-                if (orderDoc.exists()) {
-                    lastOrderCache = { id: orderDoc.id, ...orderDoc.data() };
-                    renderOrderSummaryPage(lastOrderCache, false);
-                    showUserPage('order-summary-page');
+            window.viewRequestDetails = async (requestId) => {
+                const requestRef = doc(getRequestsCollection(), requestId);
+                const requestDoc = await getDoc(requestRef);
+                if (requestDoc.exists()) {
+                    lastRequestCache = { id: requestDoc.id, ...requestDoc.data() };
+                    renderRequestSummaryPage(lastRequestCache, false); // false = not just created
+                    
+                    // --- NEW NAVIGATION ---
+                    document.getElementById('user-interface').classList.add('hidden');
+                    document.getElementById('request-summary-page').classList.remove('hidden');
+                    
+                    // Add back button
+                    document.getElementById('summary-back-btn-container').innerHTML = `
+                        <button id="summary-back-to-user" class="w-full bg-gray-600 text-white font-semibold py-3 px-4 rounded-lg hover:bg-gray-700">
+                            Back to My Requests
+                        </button>
+                    `;
+                    document.getElementById('summary-back-to-user').onclick = () => {
+                        document.getElementById('request-summary-page').classList.add('hidden');
+                        document.getElementById('user-interface').classList.remove('hidden');
+                        showUserPage('user-requests-page');
+                    };
+                    
                 } else {
-                    showToast("Order not found.", true);
+                    showToast("Request not found.", true);
                 }
             };
         }
 
         // --- 6. MANAGER: ACTIONS & RENDERING ---
         
-        // --- NEW DASHBOARD ---
         function renderDashboard() {
             const kpiPending = document.getElementById('kpi-pending-users');
             const kpiLowStock = document.getElementById('kpi-low-stock');
@@ -1055,7 +1184,7 @@
                                 <p class="font-semibold text-gray-800">${item.name}</p>
                                 <p class="text-sm font-bold text-red-600">Stock: ${item.stock}</p>
                             </div>
-                            <button onclick="handleOpenAddStockModal('${item.id}', '${item.name}', ${item.stock})" class="bg-blue-500 hover:bg-blue-600 text-white py-1 px-3 rounded-lg font-semibold text-sm">
+                            <button onclick="handleOpenAddStockModal('${item.id}', '${item.name}', ${item.stock})" class="bg-red-500 hover:bg-red-600 text-white py-1 px-3 rounded-lg font-semibold text-sm">
                                 Add Stock
                             </button>
                         </div>
@@ -1083,7 +1212,6 @@
                 `;
             });
         }
-        // --- END NEW DASHBOARD ---
 
         function renderManagerInventory(inventory) {
             const list = document.getElementById('manager-inventory-list');
@@ -1096,43 +1224,21 @@
             }
 
             inventory.forEach(item => {
-                const lastAddDate = item.lastAddition?.date?.toDate ? item.lastAddition.date.toDate().toLocaleDateString() : 'N/A';
-                const lastAddQty = item.lastAddition?.qty || 0;
-                const lastAddUser = item.lastAddition?.user || 'N/A';
-                
-                const lastWithdrawDate = item.lastWithdrawal?.date?.toDate ? item.lastWithdrawal.date.toDate().toLocaleDateString() : 'N/A';
-                const lastWithdrawQty = item.lastWithdrawal?.qty || 0;
-                const lastWithdrawUser = item.lastWithdrawal?.user || 'N/A';
-                
                 let superuserButtons = '';
                 if (currentUserRole === 'superuser') {
                     superuserButtons = `
-                        <button onclick="handleDeleteItem('${item.id}', '${item.name}')" class="w-full bg-red-600 text-white py-2 px-4 rounded-lg hover:bg-red-700 font-semibold shadow-md">
+                        <button onclick="handleDeleteItem('${item.id}', '${item.name}')" class="w-full bg-red-600 text-white py-2 px-4 rounded-lg hover:bg-red-700 font-semibold">
                             DELETE ITEM
                         </button>
                     `;
                 }
                 
+                // --- SIMPLIFIED LISTING ---
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-lg space-y-4">
+                    <div class="bg-white p-4 rounded-lg border space-y-4">
                         <div class="flex flex-col md:flex-row justify-between md:items-center">
                             <h3 class="text-xl font-semibold text-gray-800">${item.name}</h3>
-                            <span class="font-bold text-2xl text-blue-600">Stock: ${item.stock}</span>
-                        </div>
-                        
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-                            <div class="p-3 bg-green-50 rounded-lg border border-green-200">
-                                <h4 class="font-semibold text-green-800">Last Addition</h4>
-                                <p>Qty: <span class="font-medium">+${lastAddQty}</span></p>
-                                <p>Date: ${lastAddDate}</p>
-                                <p>By: ${lastAddUser}</p>
-                            </div>
-                            <div class="p-3 bg-red-50 rounded-lg border border-red-200">
-                                <h4 class="font-semibold text-red-800">Last Withdrawal</h4>
-                                <p>Qty: <span class="font-medium">-${lastWithdrawQty}</span></p>
-                                <p>Date: ${lastWithdrawDate}</p>
-                                <p>By: ${lastWithdrawUser}</p>
-                            </div>
+                            <span class="font-bold text-2xl text-red-600">Stock: ${item.stock}</span>
                         </div>
                         
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -1140,16 +1246,20 @@
                                 <label for="lowstock-${item.id}" class="text-xs font-medium text-gray-600">Low Stock At</label>
                                 <input type="number" id="lowstock-${item.id}" value="${item.lowStockThreshold}" class="mt-1 w-full p-2 border border-gray-300 rounded-lg">
                             </div>
-                            <button onclick="handleUpdateItemThreshold('${item.id}')" class="md:mt-6 bg-gray-600 text-white py-2 px-4 rounded-lg hover:bg-gray-700 font-semibold shadow-md">
+                            <button onclick="handleUpdateItemThreshold('${item.id}')" class="md:mt-6 bg-gray-600 text-white py-2 px-4 rounded-lg hover:bg-gray-700 font-semibold">
                                 Save Threshold
                             </button>
-                             <button onclick="handleOpenAddStockModal('${item.id}', '${item.name}', ${item.stock})" class="md:mt-6 bg-blue-500 text-white py-2 px-4 rounded-lg hover:bg-blue-600 font-semibold shadow-md">
+                             <button onclick="handleOpenAddStockModal('${item.id}', '${item.name}', ${item.stock})" class="md:mt-6 bg-red-500 text-white py-2 px-4 rounded-lg hover:bg-red-600 font-semibold">
                                 Add Stock
                             </button>
                         </div>
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                            <button onclick="handleEditItemName('${item.id}', '${item.name}')" class="bg-yellow-500 text-white py-2 px-4 rounded-lg hover:bg-yellow-600 font-semibold shadow-md">
+                            <button onclick="handleEditItemName('${item.id}', '${item.name}')" class="bg-yellow-500 text-white py-2 px-4 rounded-lg hover:bg-yellow-600 font-semibold">
                                 Edit Name
+                            </button>
+                            <!-- NEW HISTORY BUTTON -->
+                            <button onclick="handleViewItemHistory('${item.id}', '${item.name}')" class="bg-gray-200 text-gray-800 py-2 px-4 rounded-lg hover:bg-gray-300 font-semibold">
+                                View History
                             </button>
                             ${superuserButtons}
                         </div>
@@ -1173,26 +1283,22 @@
                     default: statusBadge = `<span class="text-xs font-medium px-2 py-1 bg-gray-100 text-gray-800 rounded-full">${user.status || 'Unknown'}</span>`;
                 }
                 
-                // Determine delete permissions
                 let canDelete = false;
                 if (currentUserRole === 'superuser' && !isCurrentUser) {
                     canDelete = true;
                 } else if (currentUserRole === 'manager' && user.role === 'user' && !isCurrentUser) {
-                    // Managers can only delete regular users (not other managers or themselves)
                     canDelete = true;
                 }
                 
-                // Determine role change permissions
                 let canChangeRole = false;
                 if (currentUserRole === 'superuser' && !isCurrentUser) {
                     canChangeRole = true;
                 } else if (currentUserRole === 'manager' && user.role === 'user' && !isCurrentUser) {
-                    // Managers can only change roles of regular users
                     canChangeRole = true;
                 }
 
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-lg flex flex-col md:flex-row justify-between gap-4">
+                    <div class="bg-white p-4 rounded-lg border flex flex-col md:flex-row justify-between gap-4">
                         <div class="flex-1">
                             <p class="font-semibold text-gray-800">${user.name || 'Profile Not Setup'} ${statusBadge}</p>
                             <p class="text-sm text-gray-600">${user.email || 'N/A'}</p>
@@ -1221,7 +1327,7 @@
                                 ${currentUserRole === 'superuser' ? `<option value="superuser" ${user.role === 'superuser' ? 'selected' : ''}>Superuser</option>` : ''}
                             </select>
                             <button onclick="handleUpdateUserRole('${user.id}')" 
-                                class="${!canChangeRole ? 'bg-gray-300 cursor-not-allowed' : 'bg-blue-500 hover:bg-blue-600'} text-white py-2 px-3 rounded-lg font-semibold text-sm"
+                                class="${!canChangeRole ? 'bg-gray-300 cursor-not-allowed' : 'bg-red-500 hover:bg-red-600'} text-white py-2 px-3 rounded-lg font-semibold text-sm"
                                 ${!canChangeRole ? 'disabled' : ''}>
                                 Update Role
                             </button>
@@ -1236,36 +1342,36 @@
             });
         }
         
-        function renderManagerOrders(orders) {
-            const list = document.getElementById('manager-orders-list');
+        function renderManagerRequests(requests) { // Renamed
+            const list = document.getElementById('manager-requests-list');
             if (!list) return;
             list.innerHTML = '';
             
-            if (orders.length === 0) {
-                list.innerHTML = '<p class="text-gray-500">No orders have been placed yet.</p>';
+            if (requests.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">No requests have been placed yet.</p>';
                 return;
             }
             
-            orders.forEach(order => {
-                const totalItems = order.items.reduce((sum, item) => sum + item.quantity, 0);
-                const orderDate = order.createdAt?.toDate ? order.createdAt.toDate().toLocaleString() : 'Pending';
+            requests.forEach(request => {
+                const totalItems = request.items.reduce((sum, item) => sum + item.quantity, 0);
+                const requestDate = request.createdAt?.toDate ? request.createdAt.toDate().toLocaleString() : 'Pending';
                 
                 let superuserButton = '';
                 if (currentUserRole === 'superuser') {
-                    superuserButton = `<button onclick="handleDeleteOrder('${order.id}')" class="bg-red-500 text-white font-semibold py-1 px-3 rounded-lg hover:bg-red-600 text-sm">Delete</button>`;
+                    superuserButton = `<button onclick="handleDeleteRequest('${request.id}')" class="bg-red-500 text-white font-semibold py-1 px-3 rounded-lg hover:bg-red-600 text-sm">Delete</button>`;
                 }
 
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-lg">
+                    <div class="bg-white p-4 rounded-lg border">
                         <div class="flex justify-between items-center">
                             <div>
-                                <h3 class="text-lg font-semibold text-gray-800">${order.userProfile?.name || 'Unknown User'}</h3>
-                                <p class="text-gray-600 text-sm">ID: ${order.id}</p>
-                                <p class="text-gray-600">${orderDate}</p>
+                                <h3 class="text-lg font-semibold text-gray-800">${request.userProfile?.name || 'Unknown User'}</h3>
+                                <p class="text-gray-600 text-sm font-mono">ID: ${request.id}</p>
+                                <p class="text-gray-600">${requestDate}</p>
                                 <p class="text-gray-600">Total Items: ${totalItems}</p>
                             </div>
                             <div class="flex flex-col gap-2 items-end">
-                                <button onclick="viewManagerOrderDetails('${order.id}')" class="bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-600">
+                                <button onclick="viewManagerRequestDetails('${request.id}')" class="bg-red-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-red-600">
                                     View
                                 </button>
                                 ${superuserButton}
@@ -1275,18 +1381,31 @@
                 `;
             });
             
-            window.viewManagerOrderDetails = async (orderId) => {
-                const orderRef = doc(getOrdersCollection(), orderId);
-                const orderDoc = await getDoc(orderRef);
-                if (orderDoc.exists()) {
-                    lastOrderCache = { id: orderDoc.id, ...orderDoc.data() };
-                    renderOrderSummaryPage(lastOrderCache, false);
-                    // Switch view to user interface to show the summary page
+            window.viewManagerRequestDetails = async (requestId) => {
+                const requestRef = doc(getRequestsCollection(), requestId);
+                const requestDoc = await getDoc(requestRef);
+                if (requestDoc.exists()) {
+                    lastRequestCache = { id: requestDoc.id, ...requestDoc.data() };
+                    renderRequestSummaryPage(lastRequestCache, false); // false = not just created
+                    
+                    // --- NEW NAVIGATION ---
                     document.getElementById('manager-interface').classList.add('hidden');
-                    document.getElementById('user-interface').classList.remove('hidden');
-                    showUserPage('order-summary-page');
+                    document.getElementById('request-summary-page').classList.remove('hidden');
+                    
+                    // Add back button
+                    document.getElementById('summary-back-btn-container').innerHTML = `
+                        <button id="summary-back-to-manager" class="w-full bg-gray-600 text-white font-semibold py-3 px-4 rounded-lg hover:bg-gray-700">
+                            Back to All Requests
+                        </button>
+                    `;
+                    document.getElementById('summary-back-to-manager').onclick = () => {
+                        document.getElementById('request-summary-page').classList.add('hidden');
+                        document.getElementById('manager-interface').classList.remove('hidden');
+                        showManagerTab('manager-requests-tab');
+                    };
+                    
                 } else {
-                    showToast("Order not found.", true);
+                    showToast("Request not found.", true);
                 }
             };
         }
@@ -1308,13 +1427,14 @@
                     superuserButton = `<button onclick="handleDeleteLog('${log.id}')" class="text-red-500 hover:text-red-700 text-xs font-semibold">Delete Log</button>`;
                 }
                 
+                // --- DATA-RICH LOG ---
                 list.innerHTML += `
-                    <div class="p-3 bg-white rounded-lg shadow-sm border-l-4 border-blue-500">
+                    <div class="p-3 bg-white rounded-lg border font-mono text-sm">
                         <div class="flex justify-between items-start">
                             <div>
                                 <p class="font-semibold text-gray-800">${log.action}</p>
-                                <p class="text-sm text-gray-600">By: <span class="font-medium">${log.user}</span></p>
-                                <p class="text-sm text-gray-600">When: ${time}</p>
+                                <p class="text-gray-600">By: <span class="font-medium">${log.user}</span></p>
+                                <p class="text-gray-600">When: ${time}</p>
                                 <details class="mt-2 text-xs">
                                     <summary class="cursor-pointer text-gray-500">Details</summary>
                                     <pre class="mt-2 p-2 bg-gray-100 rounded overflow-auto">${JSON.stringify(log.details, null, 2)}</pre>
@@ -1407,7 +1527,6 @@
             document.getElementById('modal-stock-current').textContent = currentStock;
             document.getElementById('modal-stock-add-qty').value = '';
             
-            // Clone and replace button to remove old listener
             const confirmBtn = document.getElementById('modal-stock-confirm-btn');
             const newConfirmBtn = confirmBtn.cloneNode(true);
             confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
@@ -1446,6 +1565,67 @@
             } catch (error) {
                 console.error("Add stock error: ", error);
                 showToast("Failed to add stock.", true);
+            }
+        }
+        
+        // --- NEW ITEM HISTORY FUNCTION ---
+        async function handleViewItemHistory(itemId, itemName) {
+            const modal = document.getElementById('item-history-modal');
+            const title = document.getElementById('item-history-title');
+            const list = document.getElementById('item-history-list');
+            
+            title.textContent = `History for: ${itemName}`;
+            list.innerHTML = '<p>Loading history...</p>';
+            modal.classList.remove('hidden');
+            
+            try {
+                // --- THIS QUERY REQUIRES AN INDEX ---
+                const logQuery = query(
+                    getActivityLogCollection(), 
+                    where("details.itemId", "==", itemId),
+                    orderBy('timestamp', 'desc')
+                );
+                const snapshot = await getDocs(logQuery);
+                
+                if (snapshot.empty) {
+                    list.innerHTML = '<p class="text-gray-500">No history found for this item.</p>';
+                    return;
+                }
+                
+                list.innerHTML = ''; // Clear loading
+                snapshot.docs.forEach(doc => {
+                    const log = doc.data();
+                    const time = log.timestamp?.toDate ? log.timestamp.toDate().toLocaleString() : 'Just now';
+                    
+                    let detailsText = log.action;
+                    if (log.action === 'Stock Added') {
+                        detailsText = `+${log.details.added} (New Stock: ${log.details.newStock})`;
+                    } else if (log.action === 'Request Placed') {
+                        // Find this item in the request
+                        const reqItem = log.details.items?.find(i => i.productId === itemId);
+                        if(reqItem) {
+                            detailsText = `-${reqItem.quantity} (Req ID: ${log.details.requestId.substring(0, 5)}...)`;
+                        } else {
+                            detailsText = 'Request Placed (see log)';
+                        }
+                    } else if (log.action === 'Inventory Item Name Updated') {
+                        detailsText = `Name changed from "${log.details.oldName}" to "${log.details.newName}"`;
+                    }
+                    
+                    list.innerHTML += `
+                        <div class="p-3 bg-gray-100 rounded-lg font-mono text-sm">
+                            <p><strong>${time}</strong></p>
+                            <p>By: ${log.user}</p>
+                            <p>Action: ${detailsText}</p>
+                        </div>
+                    `;
+                });
+                
+            } catch (error) {
+                console.error("Error fetching item history:", error);
+                // --- BUGFIX: Show error in UI if index is missing ---
+                list.innerHTML = `<p class="text-red-600 font-medium">Could not load history. The database may be missing a required index. Please contact your administrator.</p>
+                <p class="text-sm text-gray-600">Admin: See Step 6 in the setup guide to create the 'activity_log' index.</p>`;
             }
         }
         
@@ -1498,18 +1678,18 @@
         async function handleDeleteUser(userId, email) {
             showConfirmationModal(
                 "Delete User Data?",
-                `This will delete all app data (profile, cart) for ${email}. It will NOT delete their login/PIN. You must do that from the Firebase Console. This is how you reset a user's PIN.`,
+                `This will delete all app data (profile, request list) for ${email}. It will NOT delete their login/PIN. You must do that from the Firebase Console. This is how you reset a user's PIN.`,
                 async () => {
                     try {
                         // 1. Delete user role doc
                         const userRoleRef = doc(getUserRolesCollection(), userId);
                         await deleteDoc(userRoleRef);
                         
-                        // 2. Delete user's cart (recursive delete)
-                        const cartRef = getUserCartCollection(userId);
-                        const cartSnapshot = await getDocs(cartRef);
+                        // 2. Delete user's request list (recursive delete)
+                        const listRef = getUserRequestListCollection(userId);
+                        const listSnapshot = await getDocs(listRef);
                         const batch = writeBatch(db);
-                        cartSnapshot.forEach(doc => {
+                        listSnapshot.forEach(doc => {
                             batch.delete(doc.ref);
                         });
                         await batch.commit();
@@ -1528,29 +1708,27 @@
         
         // --- SUPERUSER ACTIONS ---
         async function handleDeleteLog(logId) {
-            // Superusers don't need confirmation
             try {
                 await deleteDoc(doc(getActivityLogCollection(), logId));
                 showToast("Log entry deleted.");
-                // Log will disappear from listener
             } catch (error) {
                 console.error("Delete log error:", error);
                 showToast("Could not delete log.", true);
             }
         }
         
-        async function handleDeleteOrder(orderId) {
+        async function handleDeleteRequest(requestId) { // Renamed
             showConfirmationModal(
-                "Delete Order?",
-                `Superuser: Delete this entire order (${orderId})? This is irreversible and will remove it from history.`,
+                "Delete Request?",
+                `Superuser: Delete this entire request (${requestId})? This is irreversible and will remove it from history.`,
                 async () => {
                     try {
-                        await deleteDoc(doc(getOrdersCollection(), orderId));
-                        await logActivity("Order Deleted (Superuser)", { deletedOrderId: orderId });
-                        showToast("Order deleted.");
+                        await deleteDoc(doc(getRequestsCollection(), requestId));
+                        await logActivity("Request Deleted (Superuser)", { deletedRequestId: requestId });
+                        showToast("Request deleted.");
                     } catch (error) {
-                        console.error("Delete order error:", error);
-                        showToast("Could not delete order.", true);
+                        console.error("Delete request error:", error);
+                        showToast("Could not delete request.", true);
                     }
                 }
             );
@@ -1576,6 +1754,9 @@
         
         // --- 7. EVENT LISTENERS ---
         function setupStaticEventListeners() {
+            // New public login button
+            document.getElementById('public-login-btn').addEventListener('click', () => showView('login-view'));
+        
             document.querySelector('button[onclick="handleLogout()"]').addEventListener('click', handleLogout);
             
             // User Nav
@@ -1602,7 +1783,7 @@
             
             // Other Listeners
             document.querySelector('button[onclick="handleAddInventoryItem()"]').addEventListener('click', handleAddInventoryItem);
-            document.getElementById('confirm-order-btn').addEventListener('click', handleSubmitOrder);
+            document.getElementById('confirm-request-btn').addEventListener('click', handleSubmitRequest);
             document.getElementById('copy-summary-btn').addEventListener('click', handleCopySummary);
             
             // Auth Listeners
@@ -1614,13 +1795,13 @@
             // Modal Listeners
             document.getElementById('modal-cancel-btn').addEventListener('click', closeConfirmationModal);
             document.getElementById('modal-stock-cancel-btn').addEventListener('click', closeAddStockModal);
+            document.getElementById('item-history-close-btn').addEventListener('click', closeItemHistoryModal);
         }
 
         // --- 8. GLOBAL EXPORTS & INITIALIZATION ---
-        // Expose functions needed by *dynamic* inline 'onclick' attributes
-        window.handleAddToCart = handleAddToCart;
-        window.handleUpdateCartQuantity = handleUpdateCartQuantity;
-        window.handleRemoveFromCart = handleRemoveFromCart;
+        window.handleAddToRequest = handleAddToRequest;
+        window.handleUpdateRequestQuantity = handleUpdateRequestQuantity;
+        window.handleRemoveFromRequest = handleRemoveFromRequest;
         window.handleUpdateItemThreshold = handleUpdateItemThreshold;
         window.handleUpdateUserRole = handleUpdateUserRole;
         window.handleApproveUser = handleApproveUser;
@@ -1628,8 +1809,9 @@
         window.handleDeleteUser = handleDeleteUser;
         window.handleOpenAddStockModal = handleOpenAddStockModal;
         window.handleEditItemName = handleEditItemName;
+        window.handleViewItemHistory = handleViewItemHistory;
         window.handleDeleteLog = handleDeleteLog;
-        window.handleDeleteOrder = handleDeleteOrder;
+        window.handleDeleteRequest = handleDeleteRequest;
         window.handleDeleteItem = handleDeleteItem;
         window.handleLogout = handleLogout;
         window.showUserPage = showUserPage;
@@ -1638,6 +1820,7 @@
         document.addEventListener('DOMContentLoaded', () => {
             initializeFirebase();
             setupStaticEventListeners();
+            showView('public-view'); // Start on public view, not loading
         });
         
     </script>
@@ -1654,78 +1837,113 @@
         }
         @keyframes spin { to { transform: rotate(360deg); } }
         
-        .icon-cart::before { content: '🛒'; margin-right: 8px; }
-        .icon-shop::before { content: '🛍️'; margin-right: 8px; }
-        .icon-orders::before { content: '🧾'; margin-right: 8px; }
-        .icon-profile::before { content: '👤'; margin-right: 8px; }
-        .icon-dashboard::before { content: '📊'; margin-right: 8px; }
-        .icon-inventory::before { content: '📦'; margin-right: 8px; }
-        .icon-users::before { content: '👥'; margin-right: 8px; }
-        .icon-log::before { content: 'L'; margin-right: 8px; font-weight: bold; font-family: monospace; }
-        
         /* Modal Backdrop */
         .modal-backdrop {
             background-color: rgba(0, 0, 0, 0.5);
         }
+        
+        /* Remove all shadows */
+        .shadow-lg, .shadow-xl, .shadow-md, .shadow-sm, .shadow, .shadow-inner {
+             box-shadow: none !important;
+        }
+        body {
+            font-family: Arial, sans-serif;
+        }
     </style>
 </head>
 
-<body class="bg-gray-200 min-h-screen flex flex-col">
+<body class="bg-gray-100 min-h-screen flex flex-col">
 
-    <!-- Loading View -->
+    <!-- Loading View (kept for initial JS load) -->
     <div id="loading-view" class="flex items-center justify-center min-h-screen">
-        <div class="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-blue-500"></div>
+        <div class="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-red-500"></div>
+    </div>
+    
+    <!-- NEW Public View -->
+    <div id="public-view" class="hidden flex-grow max-w-5xl mx-auto p-4 md:p-6 w-full">
+        <header class="flex flex-col md:flex-row justify-between md:items-center mb-6 p-6 bg-white rounded-lg border">
+            <div>
+                <h1 class="text-4xl font-extrabold text-red-800">STORE-SIGHT</h1>
+                <p class="text-gray-600">Hubli_Budarshingi_H Inventory-Stock Management</p>
+                <p class="text-lg text-gray-800 font-bold mt-2">Store In-Charge: Ankita Chandrappa Bandi</p>
+            </div>
+            <div class="mt-4 md:mt-0 text-left md:text-right">
+                <button id="public-login-btn" class="bg-red-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-red-700">
+                    Employee Login
+                </button>
+            </div>
+        </header>
+        
+        <main class="bg-white p-4 md:p-6 rounded-lg border">
+            <h2 class="text-3xl font-bold mb-4 text-red-800 border-b-2 border-red-200 pb-2">Live Inventory Stock</h2>
+            <p id="last-update-time" class="text-sm text-gray-500 mb-4">Loading...</p>
+            <p id="public-inventory-error" class="hidden text-sm text-red-600 mb-4"></p>
+            
+            <div class="overflow-x-auto max-h-[60vh] overflow-y-auto border rounded-lg">
+                <table class="w-full text-left">
+                    <thead class="bg-gray-100 sticky top-0">
+                        <tr>
+                            <th class="px-4 py-3 font-semibold text-gray-700">Item Name</th>
+                            <th class="px-4 py-3 font-semibold text-gray-700">Stock</th>
+                            <th class="px-4 py-3 font-semibold text-gray-700">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="public-inventory-list">
+                        <!-- JS renders public inventory here -->
+                        <tr><td colspan="3" class="px-4 py-3 text-center text-gray-500">Loading inventory...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </main>
     </div>
 
     <!-- Login View -->
     <div id="login-view" class="hidden flex-grow flex items-center justify-center p-4">
         <div class="w-full max-w-md">
-            <h1 class="text-4xl font-extrabold text-blue-800 text-center mb-2">Hubli - StoreInsights</h1>
-            <p class="text-center text-gray-600 mb-6">Your friendly neighborhood store, digitized.</p>
+            <h1 class="text-4xl font-extrabold text-red-800 text-center mb-2">STORE-SIGHT</h1>
+            <p class="text-center text-gray-600 mb-6">Hubli_Budarshingi_H Inventory-Stock Management</p>
             
-            <!-- Login Form -->
-            <form id="login-form" class="p-8 bg-white rounded-xl shadow-xl space-y-4">
-                <h2 class="text-2xl font-bold text-gray-800 text-center">Login</h2>
+            <form id="login-form" class="p-8 bg-white rounded-lg border space-y-4">
+                <h2 class="text-2xl font-bold text-gray-800 text-center">Employee Login</h2>
                 <div>
                     <label for="login-empid" class="block text-sm font-medium text-gray-700">Employee ID</label>
-                    <input type="text" id="login-empid" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
+                    <input type="text" id="login-empid" required class="mt-1 block w-full rounded-lg border-gray-300 focus:border-red-500 focus:ring-2 focus:ring-red-300">
                 </div>
                 <div>
                     <label for="login-pin" class="block text-sm font-medium text-gray-700">4-Digit PIN</label>
-                    <input type="password" id="login-pin" required maxlength="4" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
+                    <input type="password" id="login-pin" required maxlength="4" class="mt-1 block w-full rounded-lg border-gray-300 focus:border-red-500 focus:ring-2 focus:ring-red-300">
                 </div>
                 
                 <div id="auth-error-message" class="hidden text-sm text-red-600 font-medium"></div>
 
-                <button id="login-button" type="submit" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 shadow-md flex items-center justify-center gap-2">
+                <button id="login-button" type="submit" class="w-full bg-red-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-red-700 flex items-center justify-center gap-2">
                     <span id="login-spinner" class="spinner hidden"></span>
                     Login
                 </button>
                 <p class="text-sm text-center text-gray-600">
                     Don't have an account? 
-                    <a href="#" id="toggle-to-register" class="font-medium text-blue-600 hover:underline">Register here</a>
+                    <a href="#" id="toggle-to-register" class="font-medium text-red-600 hover:underline">Register here</a>
                 </p>
             </form>
             
-            <!-- Registration Form -->
-            <form id="register-form" class="hidden p-8 bg-white rounded-xl shadow-xl space-y-4">
+            <form id="register-form" class="hidden p-8 bg-white rounded-lg border space-y-4">
                 <h2 class="text-2xl font-bold text-gray-800 text-center">Register</h2>
                 <div>
                     <label for="register-empid" class="block text-sm font-medium text-gray-700">Employee ID</label>
-                    <input type="text" id="register-empid" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
+                    <input type="text" id="register-empid" required class="mt-1 block w-full rounded-lg border-gray-300 focus:border-red-500 focus:ring-2 focus:ring-red-300">
                 </div>
                 <div>
                     <label for="register-pin" class="block text-sm font-medium text-gray-700">Create 4-Digit PIN</label>
-                    <input type="password" id="register-pin" required maxlength="4" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
+                    <input type="password" id="register-pin" required maxlength="4" class="mt-1 block w-full rounded-lg border-gray-300 focus:border-red-500 focus:ring-2 focus:ring-red-300">
                 </div>
 
-                <button id="register-button" type="submit" class="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 shadow-md flex items-center justify-center gap-2">
+                <button id="register-button" type="submit" class="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 flex items-center justify-center gap-2">
                     <span id="register-spinner" class="spinner hidden"></span>
                     Register
                 </button>
                 <p class="text-sm text-center text-gray-600">
                     Already have an account? 
-                    <a href="#" id="toggle-to-login" class="font-medium text-blue-600 hover:underline">Login here</a>
+                    <a href="#" id="toggle-to-login" class="font-medium text-red-600 hover:underline">Login here</a>
                 </p>
             </form>
         </div>
@@ -1738,7 +1956,7 @@
     
     <!-- Pending Approval View -->
     <div id="pending-view" class="hidden flex-grow flex items-center justify-center p-4 text-center">
-        <div class="bg-white p-8 rounded-xl shadow-xl max-w-lg">
+        <div class="bg-white p-8 rounded-lg border max-w-lg">
             <h1 class="text-2xl font-bold text-gray-800 mb-4">Account Pending Approval</h1>
             <p class="text-gray-600 mb-6">Your profile is complete, but a manager still needs to approve your account before you can access the store. Please check back later.</p>
             <button onclick="handleLogout()" class="mt-2 text-sm text-red-500 hover:underline">
@@ -1749,7 +1967,7 @@
     
     <!-- Suspended View -->
     <div id="suspended-view" class="hidden flex-grow flex items-center justify-center p-4 text-center">
-        <div class="bg-white p-8 rounded-xl shadow-xl max-w-lg">
+        <div class="bg-white p-8 rounded-lg border max-w-lg">
             <h1 class="text-2xl font-bold text-red-600 mb-4">Account Suspended</h1>
             <p class="text-gray-600 mb-6">Your account has been suspended. Please contact a manager for more information.</p>
             <button onclick="handleLogout()" class="mt-2 text-sm text-red-500 hover:underline">
@@ -1762,16 +1980,17 @@
     <!-- Main App Container -->
     <div id="app-container" class="hidden flex-grow max-w-5xl mx-auto p-4 md:p-6 w-full">
         <!-- Header -->
-        <header class="flex flex-col md:flex-row justify-between md:items-center mb-6 p-6 bg-white rounded-xl shadow-xl border-b-4 border-blue-700">
+        <header class="flex flex-col md:flex-row justify-between md:items-center mb-6 p-6 bg-white rounded-lg border-b-4 border-red-700">
             <div>
-                <h1 class="text-4xl font-extrabold text-blue-800">Hubli - StoreInsights</h1>
-                <p class="text-gray-600">Your friendly neighborhood store, digitized.</p>
+                <h1 class="text-4xl font-extrabold text-red-800">STORE-SIGHT</h1>
+                <p class="text-gray-600">Hubli_Budarshingi_H Inventory-Stock Management</p>
             </div>
             <div class="mt-4 md:mt-0 text-left md:text-right">
-                <div class="text-sm text-gray-600 break-all">
+                <p class="text-lg text-gray-800 font-bold">Store In-Charge: Ankita Chandrappa Bandi</p>
+                <div class="text-sm text-gray-600 break-all mt-2">
                     <span id="user-id-display"></span>
                 </div>
-                <div class="text-sm font-semibold text-blue-600">
+                <div class="text-sm font-semibold text-red-600">
                     <span id="user-role-display"></span>
                 </div>
                 <button onclick="handleLogout()" class="mt-2 text-sm text-red-500 hover:underline">
@@ -1781,39 +2000,39 @@
         </header>
 
         <!-- User Navigation -->
-        <nav id="user-nav" class="flex justify-around bg-white rounded-xl shadow-lg p-2 mb-6">
-            <button data-page="user-inventory-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg icon-shop">
-                Shop
+        <nav id="user-nav" class="flex justify-around bg-white rounded-lg border p-2 mb-6">
+            <button data-page="user-inventory-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg">
+                Browse Items
             </button>
-            <button data-page="user-cart-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg icon-cart">
-                Cart
+            <button data-page="user-request-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg">
+                Request List
             </button>
-            <button data-page="user-orders-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg icon-orders">
-                My Orders
+            <button data-page="user-requests-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg">
+                My Requests
             </button>
-            <button data-page="user-profile-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg icon-profile">
+            <button data-page="user-profile-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg">
                 My Profile
             </button>
         </nav>
         
         <!-- Manager Navigation -->
-        <nav id="manager-nav" class="hidden flex flex-wrap justify-center bg-gray-800 rounded-xl shadow-lg p-2 mb-6 gap-2">
-            <button data-tab="dashboard-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-blue-700 hover:bg-blue-600 rounded-lg icon-dashboard">
+        <nav id="manager-nav" class="hidden flex flex-wrap justify-center bg-gray-800 rounded-lg p-2 mb-6 gap-2">
+            <button data-tab="dashboard-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-red-700 hover:bg-red-600 rounded-lg">
                 Dashboard
             </button>
-            <button data-tab="inventory-mgt-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-inventory">
+            <button data-tab="inventory-mgt-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-red-600 rounded-lg">
                 Inventory
             </button>
-            <button data-tab="manager-orders-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-orders">
-                All Orders
+            <button data-tab="manager-requests-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-red-600 rounded-lg">
+                All Requests
             </button>
-            <button data-tab="user-mgt-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-users">
+            <button data-tab="user-mgt-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-red-600 rounded-lg">
                 User Mgt
             </button>
-             <button data-tab="activity-log-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-log">
+             <button data-tab="activity-log-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-red-600 rounded-lg">
                 Activity Log
             </button>
-            <button data-tab="user-profile-page" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-profile">
+            <button data-tab="user-profile-page" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-red-600 rounded-lg">
                 My Profile
             </button>
         </nav>
@@ -1821,64 +2040,52 @@
         <!-- ================================== -->
         <!--        COMMON PAGES (USER)         -->
         <!-- ================================== -->
-        <main id="user-interface" class="hidden bg-gray-50 p-4 md:p-6 rounded-xl shadow-inner">
+        <main id="user-interface" class="hidden bg-gray-50 p-4 md:p-6 rounded-lg border">
             <!-- User Page: Inventory -->
             <div id="user-inventory-page">
-                <h2 class="text-2xl font-semibold mb-4">Products</h2>
+                <h2 class="text-3xl font-bold mb-4 text-red-800 border-b-2 border-red-200 pb-2">Products</h2>
                 <div id="user-inventory-list" class="space-y-4"></div>
             </div>
 
-            <!-- User Page: Cart -->
-            <div id="user-cart-page" class="hidden">
-                <h2 class="text-2xl font-semibold mb-4">Your Cart</h2>
-                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
-                    <div id="cart-items-list" class="space-y-4 mb-5"></div>
+            <!-- User Page: Request List -->
+            <div id="user-request-page" class="hidden">
+                <h2 class="text-3xl font-bold mb-4 text-red-800 border-b-2 border-red-200 pb-2">Your Request List</h2>
+                <div class="bg-white p-4 md:p-6 rounded-lg border">
+                    <div id="request-items-list" class="space-y-4 mb-5"></div>
                     <hr class="my-4">
                     <div class="flex justify-between items-center mb-5">
                         <span class="text-lg font-medium text-gray-800">Total:</span>
-                        <span id="cart-total" class="text-lg font-bold text-gray-900">0 items</span>
+                        <span id="request-total" class="text-lg font-bold text-gray-900">0 items</span>
                     </div>
-                    <button id="go-to-checkout-btn" class="w-full bg-green-500 text-white font-semibold py-3 px-4 rounded-lg hover:bg-green-600 shadow-md">
-                        Proceed to Checkout
+                    <button id="go-to-checkout-btn" class="w-full bg-green-500 text-white font-semibold py-3 px-4 rounded-lg hover:bg-green-600">
+                        Proceed to Submit
                     </button>
                 </div>
             </div>
             
-            <!-- User Page: Checkout -->
+            <!-- User Page: Checkout (Submit Request) -->
             <div id="user-checkout-page" class="hidden">
-                <h2 class="text-2xl font-semibold mb-4">Checkout</h2>
-                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
-                    <h3 class="text-xl font-semibold mb-4">1. Order Details</h3>
+                <h2 class="text-3xl font-bold mb-4 text-red-800 border-b-2 border-red-200 pb-2">Submit Request</h2>
+                <div class="bg-white p-4 md:p-6 rounded-lg border">
+                    <h3 class="text-xl font-semibold mb-4">1. Request Details</h3>
                     <div id="checkout-items-list" class="space-y-6 mb-6"></div>
                     <h3 class="text-xl font-semibold mb-4">2. Supervision</h3>
                     <div>
                         <label for="supervisor-name" class="block text-sm font-medium text-gray-700">Withdrawal Under Supervision Of:</label>
-                        <input type="text" id="supervisor-name" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm" placeholder="Enter full name of security/supervisor">
+                        <input type="text" id="supervisor-name" class="mt-1 block w-full rounded-lg border-gray-300 sm:text-sm" placeholder="Enter full name of security/supervisor">
                     </div>
                     <hr class="my-6">
-                    <button id="confirm-order-btn" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 shadow-md">
-                        Confirm Order
+                    <button id="confirm-request-btn" class="w-full bg-red-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-red-700">
+                        Confirm Request
                     </button>
                 </div>
             </div>
             
-            <!-- User Page: Order History -->
-            <div id="user-orders-page" class="hidden">
-                <h2 class="text-2xl font-semibold mb-4">My Order History</h2>
-                <div id="user-orders-list" class="space-y-4"></div>
-            </div>
-            
-            <!-- User Page: Order Summary -->
-            <div id="order-summary-page" class="hidden">
-                <h2 class="text-2xl font-semibold mb-4 text-green-600">Order Placed Successfully!</h2>
-                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
-                    <div class="flex justify-between items-center mb-4">
-                        <h3 class="text-xl font-semibold">Order Summary</h3>
-                        <button id="copy-summary-btn" class="bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-600">
-                            Copy Summary
-                        </button>
-                    </div>
-                    <div id="order-summary-details"></div>
+            <!-- User Page: Request History -->
+            <div id="user-requests-page" class="hidden">
+                <h2 class="text-3xl font-bold mb-4 text-red-800 border-b-2 border-red-200 pb-2">My Request History</h2>
+                <div id="user-requests-list" class="space-y-4">
+                    <!-- JS renders history or error here -->
                 </div>
             </div>
         </main>
@@ -1886,57 +2093,47 @@
         <!-- ================================== -->
         <!--        COMMON PAGES (MANAGER)      -->
         <!-- ================================== -->
-        <main id="manager-interface" class="hidden bg-gray-50 p-4 md:p-6 rounded-xl shadow-inner">
+        <main id="manager-interface" class="hidden bg-gray-50 p-4 md:p-6 rounded-lg border">
             <!-- Manager Tab: Dashboard -->
             <div id="dashboard-tab">
-                <h2 class="text-2xl font-semibold mb-4">Manager Dashboard</h2>
+                <h2 class="text-3xl font-bold mb-4 text-red-800 border-b-2 border-red-200 pb-2">Manager Dashboard</h2>
                 
-                <!-- KPIs -->
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-                    <div class="bg-white p-4 rounded-xl shadow-lg text-center">
+                    <div class="bg-white p-4 rounded-lg border text-center">
                         <h3 class="text-sm font-medium text-gray-500">Pending Users</h3>
                         <p id="kpi-pending-users" class="text-3xl font-bold text-gray-800">0</p>
                     </div>
-                    <div class="bg-white p-4 rounded-xl shadow-lg text-center">
+                    <div class="bg-white p-4 rounded-lg border text-center">
                         <h3 class="text-sm font-medium text-gray-500">Low Stock Items</h3>
                         <p id="kpi-low-stock" class="text-3xl font-bold text-gray-800">0</p>
                     </div>
-                    <div class="bg-white p-4 rounded-xl shadow-lg text-center">
+                    <div class="bg-white p-4 rounded-lg border text-center">
                         <h3 class="text-sm font-medium text-gray-500">Total Item Types</h3>
                         <p id="kpi-total-items" class="text-3xl font-bold text-gray-800">0</p>
                     </div>
                 </div>
                 
-                <!-- NEW INTERACTIVE DASHBOARD -->
                 <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
                     <!-- Pending Users -->
-                    <div class="lg:col-span-1 bg-white p-4 md:p-6 rounded-xl shadow-xl">
-                        <h3 class="text-xl font-semibold mb-4 text-gray-800">Pending Approvals</h3>
-                        <div id="dashboard-pending-list" class="space-y-3 max-h-64 overflow-y-auto">
-                            <!-- JS renders pending users here -->
-                        </div>
+                    <div class="lg:col-span-1 bg-white p-4 md:p-6 rounded-lg border">
+                        <h3 class="text-xl font-semibold mb-4 text-gray-800 border-b pb-2">Pending Approvals</h3>
+                        <div id="dashboard-pending-list" class="space-y-3 max-h-64 overflow-y-auto"></div>
                         <button id="dash-view-all-pending" class="w-full mt-4 bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300">
                             View All Users
                         </button>
                     </div>
                     
-                    <!-- Low Stock -->
-                    <div class="lg:col-span-1 bg-white p-4 md:p-6 rounded-xl shadow-xl">
-                        <h3 class="text-xl font-semibold mb-4 text-gray-800">Low Stock Items</h3>
-                        <div id="dashboard-low-stock-list" class="space-y-3 max-h-64 overflow-y-auto">
-                            <!-- JS renders low stock items here -->
-                        </div>
+                    <div class="lg:col-span-1 bg-white p-4 md:p-6 rounded-lg border">
+                        <h3 class="text-xl font-semibold mb-4 text-gray-800 border-b pb-2">Low Stock Items</h3>
+                        <div id="dashboard-low-stock-list" class="space-y-3 max-h-64 overflow-y-auto"></div>
                         <button id="dash-view-all-low" class="w-full mt-4 bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300">
                             View All Inventory
                         </button>
                     </div>
                     
-                    <!-- Recent Activity -->
-                    <div class="lg:col-span-1 bg-white p-4 md:p-6 rounded-xl shadow-xl">
-                        <h3 class="text-xl font-semibold mb-4 text-gray-800">Recent Activity</h3>
-                        <div id="dashboard-recent-activity" class="space-y-2 max-h-64 overflow-y-auto">
-                            <!-- JS renders activity here -->
-                        </div>
+                    <div class="lg:col-span-1 bg-white p-4 md:p-6 rounded-lg border">
+                        <h3 class="text-xl font-semibold mb-4 text-gray-800 border-b pb-2">Recent Activity</h3>
+                        <div id="dashboard-recent-activity" class="space-y-2 max-h-64 overflow-y-auto"></div>
                         <button id="dash-view-all-logs" class="w-full mt-4 bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300">
                             View Full Log
                         </button>
@@ -1946,47 +2143,46 @@
 
             <!-- Manager Tab: Inventory Management -->
             <div id="inventory-mgt-tab" class="hidden">
-                <h2 class="text-2xl font-semibold mb-4">Inventory Management</h2>
-                <!-- Add New Item Form -->
-                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl mb-6">
-                    <h3 class="text-xl font-semibold mb-4 text-gray-800">Add New Item</h3>
+                <h2 class="text-3xl font-bold mb-4 text-red-800 border-b-2 border-red-200 pb-2">Inventory Management</h2>
+                
+                <div class="bg-white p-4 md:p-6 rounded-lg border mb-6">
+                    <h3 class="text-xl font-semibold mb-4 text-gray-800 border-b pb-2">Add New Item</h3>
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                         <input type="text" id="item-name" placeholder="Item Name" class="col-span-1 md:col-span-2 p-3 border rounded-lg">
                         <input type="number" id="item-stock" placeholder="Initial Stock" value="10" class="p-3 border rounded-lg">
                     </div>
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
                         <input type="number" id="item-low-stock" placeholder="Low Stock Threshold" value="5" class="p-3 border rounded-lg">
-                        <button onclick="handleAddInventoryItem()" class="col-span-1 md:col-span-2 bg-green-500 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-600 shadow-md">
+                        <button onclick="handleAddInventoryItem()" class="col-span-1 md:col-span-2 bg-green-500 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-600">
                             Add New Item
                         </button>
                     </div>
                 </div>
                 
-                <!-- Manage Existing Items -->
-                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
-                    <h3 class="text-xl font-semibold mb-4 text-gray-800">Manage Stock</h3>
+                <div class="bg-white p-4 md:p-6 rounded-lg border">
+                    <h3 class="text-xl font-semibold mb-4 text-gray-800 border-b pb-2">Manage Stock</h3>
                     <div id="manager-inventory-list" class="space-y-4"></div>
                 </div>
             </div>
             
-            <!-- Manager Tab: Order History -->
-            <div id="manager-orders-tab" class="hidden">
-                <h2 class="text-2xl font-semibold mb-4">All Order History</h2>
-                <div id="manager-orders-list" class="space-y-4"></div>
+            <!-- Manager Tab: Request History -->
+            <div id="manager-requests-tab" class="hidden">
+                <h2 class="text-3xl font-bold mb-4 text-red-800 border-b-2 border-red-200 pb-2">All Request History</h2>
+                <div id="manager-requests-list" class="space-y-4"></div>
             </div>
             
             <!-- Manager Tab: User Management -->
             <div id="user-mgt-tab" class="hidden">
-                <h2 class="text-2xl font-semibold mb-4">User Role Management</h2>
-                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                <h2 class="text-3xl font-bold mb-4 text-red-800 border-b-2 border-red-200 pb-2">User Role Management</h2>
+                <div class="bg-white p-4 md:p-6 rounded-lg border">
                     <div id="user-roles-list" class="space-y-4"></div>
                 </div>
             </div>
             
              <!-- Manager Tab: Activity Log -->
             <div id="activity-log-tab" class="hidden">
-                <h2 class="text-2xl font-semibold mb-4">Activity Log (Ledger)</h2>
-                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                <h2 class="text-3xl font-bold mb-4 text-red-800 border-b-2 border-red-200 pb-2">Activity Log (Ledger)</h2>
+                <div class="bg-white p-4 md:p-6 rounded-lg border">
                     <div id="activity-log-list" class="space-y-3 max-h-[800px] overflow-y-auto"></div>
                 </div>
             </div>
@@ -1994,25 +2190,41 @@
         </main>
         
         <!-- Common Page: Profile (Used by both User & Manager) -->
-        <div id="user-profile-page" class="hidden bg-gray-50 p-4 md:p-6 rounded-xl shadow-inner">
+        <div id="user-profile-page" class="hidden bg-gray-50 p-4 md:p-6 rounded-lg border">
             <!-- JS will render the profile form here -->
+        </div>
+        
+        <!-- Common Page: Request Summary (MOVED HERE) -->
+        <div id="request-summary-page" class="hidden bg-gray-50 p-4 md:p-6 rounded-lg border">
+            <h2 id="request-summary-title" class="text-2xl font-semibold mb-4 text-green-600"></h2>
+            <div class="bg-white p-4 md:p-6 rounded-lg border">
+                <div class="flex justify-between items-center mb-4">
+                    <h3 class="text-2xl font-bold text-red-800 border-b-2 border-red-200 pb-2">Withdrawal Slip</h3>
+                    <button id="copy-summary-btn" class="bg-red-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-red-600">
+                        Copy Summary
+                    </button>
+                </div>
+                <div id="request-summary-details"></div>
+                <!-- Back Button Container -->
+                <div id="summary-back-btn-container" class="mt-6"></div>
+            </div>
         </div>
         
     </div>
     
     <!-- Footer -->
     <footer class="text-center py-4 mt-8">
-        <p class="text-sm text-gray-600">Designed by Rh. for ⚡ Team Sonic - Hubli</p>
+        <p class="text-sm text-gray-600">Designed by Rh. for ⚡ Team Sonic</p>
     </footer>
     
     <!-- Toast Notification -->
-    <div id="toast-message" class="hidden opacity-0 fixed top-5 right-5 z-50 bg-green-600 text-white py-3 px-6 rounded-lg shadow-xl transition-all duration-500">
+    <div id="toast-message" class="hidden opacity-0 fixed top-5 right-5 z-50 bg-green-600 text-white py-3 px-6 rounded-lg border transition-all duration-500">
         <!-- Message set by JS -->
     </div>
     
     <!-- Confirmation Modal -->
     <div id="confirmation-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop">
-        <div class="bg-white rounded-xl shadow-2xl p-6 max-w-sm w-full">
+        <div class="bg-white rounded-lg border p-6 max-w-sm w-full">
             <h2 id="modal-title" class="text-xl font-bold text-gray-900 mb-4">Are you sure?</h2>
             <p id="modal-message" class="text-gray-600 mb-6">This action cannot be undone.</p>
             <div class="flex justify-end gap-3">
@@ -2028,20 +2240,35 @@
     
     <!-- Add Stock Modal -->
     <div id="add-stock-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop">
-        <div class="bg-white rounded-xl shadow-2xl p-6 max-w-sm w-full">
+        <div class="bg-white rounded-lg border p-6 max-w-sm w-full">
             <h2 class="text-xl font-bold text-gray-900 mb-4">Add Stock</h2>
             <p class="text-gray-600 mb-2">Item: <span id="modal-stock-item-name" class="font-semibold"></span></p>
             <p class="text-gray-600 mb-4">Current Stock: <span id="modal-stock-current" class="font-semibold"></span></p>
             <div>
                 <label for="modal-stock-add-qty" class="block text-sm font-medium text-gray-700">Quantity to Add:</label>
-                <input type="number" id="modal-stock-add-qty" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm">
+                <input type="number" id="modal-stock-add-qty" class="mt-1 block w-full rounded-lg border-gray-300 sm:text-sm">
             </div>
             <div class="flex justify-end gap-3 mt-6">
                 <button id="modal-stock-cancel-btn" class="bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300">
                     Cancel
                 </button>
-                <button id="modal-stock-confirm-btn" class="bg-blue-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-700">
+                <button id="modal-stock-confirm-btn" class="bg-red-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-red-700">
                     Add
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- NEW Item History Modal -->
+    <div id="item-history-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop">
+        <div class="bg-white rounded-lg border p-6 max-w-lg w-full">
+            <h2 id="item-history-title" class="text-xl font-bold text-gray-900 mb-4">Item History</h2>
+            <div id="item-history-list" class="space-y-3 max-h-[60vh] overflow-y-auto bg-gray-50 p-4 rounded-lg border">
+                <!-- JS renders history or error here -->
+            </div>
+            <div class="flex justify-end gap-3 mt-6">
+                <button id="item-history-close-btn" class="bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300">
+                    Close
                 </button>
             </div>
         </div>
