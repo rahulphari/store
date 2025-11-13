@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Inventory Management</title>
+    <title>Hubli - StoreInsights</title>
     <!-- 1. Tailwind CSS for styling -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- 2. Firebase SDK (ES Module) -->
@@ -13,8 +13,6 @@
         import { 
             getAuth, 
             onAuthStateChanged, 
-            signInAnonymously, 
-            signInWithCustomToken, 
             signOut,
             createUserWithEmailAndPassword,
             signInWithEmailAndPassword
@@ -30,6 +28,8 @@
             onSnapshot, 
             collection, 
             query, 
+            where,
+            orderBy,
             serverTimestamp,
             runTransaction,
             writeBatch,
@@ -39,10 +39,19 @@
 
         // --- GLOBAL VARIABLES ---
         let db, auth;
-        let currentUserId, currentUserRole;
+        let currentUserId, currentUserEmail, currentUserRole;
+        let currentUserProfile = null;
+        let lastOrderCache = null; // To hold data for the summary page
+        
+        // Data Caches
+        let inventoryCache = [];
+        let localCartCache = [];
+
+        // Listeners
         let unsubscribeInventory = () => {};
         let unsubscribeCart = () => {};
-        let unsubscribeOrders = () => {};
+        let unsubscribeUserOrders = () => {};
+        let unsubscribeManagerOrders = () => {};
         let unsubscribeUserRoles = () => {};
 
         // --- USER'S FIREBASE CONFIG ---
@@ -63,13 +72,9 @@
 
 
         // --- DATABASE PATHS ---
-        // Public collection for all inventory items
         const getInventoryCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'inventory');
-        // Public collection for user roles
         const getUserRolesCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'user_roles');
-        // Public collection for all orders (for manager to see)
         const getOrdersCollection = () => collection(db, 'artifacts', appId, 'public', 'data', 'orders');
-        // Private collection for a specific user's cart
         const getUserCartCollection = (userId) => collection(db, 'artifacts', appId, 'users', userId, 'cart');
 
         // --- 1. INITIALIZATION ---
@@ -78,8 +83,7 @@
                 const app = initializeApp(firebaseConfig);
                 auth = getAuth(app);
                 db = getFirestore(app);
-                setLogLevel('Debug'); // Enable verbose logging for Firestore
-                
+                setLogLevel('Debug');
                 setupAuthListener();
             } catch (error) {
                 console.error("Firebase Init Error:", error);
@@ -87,63 +91,116 @@
             }
         }
 
-        // --- 2. AUTHENTICATION ---
+        // --- 2. AUTHENTICATION & PROFILE ---
         function setupAuthListener() {
             onAuthStateChanged(auth, async (user) => {
-                // Detach all old listeners
                 unsubscribeAll();
-
                 if (user) {
                     currentUserId = user.uid;
-                    await checkUserRole(user); // Pass the full user object
-                    showView('app-container');
-                    document.getElementById('user-id-display').textContent = `User: ${user.email}`;
-                    document.getElementById('user-role-display').textContent = `Role: ${currentUserRole}`;
+                    currentUserEmail = user.email;
+                    await checkUserRoleAndProfile(user);
                 } else {
                     currentUserId = null;
+                    currentUserEmail = null;
                     currentUserRole = null;
-                    showView('login-view'); // User is logged out, show the login page
+                    currentUserProfile = null;
+                    showView('login-view');
                 }
             });
         }
 
-        async function checkUserRole(user) {
+        async function checkUserRoleAndProfile(user) {
             const userId = user.uid;
-            const userEmail = user.email;
             const userRoleRef = doc(getUserRolesCollection(), userId);
             const userDoc = await getDoc(userRoleRef);
 
             if (userDoc.exists()) {
-                currentUserRole = userDoc.data().role;
+                const data = userDoc.data();
+                currentUserRole = data.role;
+                currentUserProfile = {
+                    name: data.name || '',
+                    empId: data.empId || '',
+                    designation: data.designation || '',
+                    email: data.email || user.email // Ensure email is always present
+                };
+                
+                // If user has no name, they are a new user who needs to set up their profile.
+                if (!currentUserProfile.name) {
+                    renderProfilePage(true); // 'true' for isFirstTime setup
+                    showView('profile-setup-view');
+                } else {
+                    // Normal login
+                    showView('app-container');
+                    document.getElementById('user-id-display').textContent = `User: ${currentUserProfile.name} (${currentUserEmail})`;
+                    document.getElementById('user-role-display').textContent = `Role: ${currentUserRole}`;
+                    setupUIForRole(currentUserRole);
+                    attachDataListeners(currentUserRole, userId);
+                }
             } else {
-                // New user, create a default 'user' role
+                // New user, create a default 'user' role and force profile setup
                 currentUserRole = 'user';
                 await setDoc(userRoleRef, { 
                     role: 'user', 
                     created: serverTimestamp(),
-                    userId: userId, // Store userId for easier querying by managers
-                    email: userEmail  // Store user email
+                    userId: userId,
+                    email: user.email,
+                    name: "", // Empty name signals profile setup is needed
+                    empId: "",
+                    designation: ""
                 });
+                // Recurse to trigger profile setup
+                await checkUserRoleAndProfile(user);
             }
-            setupUIForRole(currentUserRole);
-            attachDataListeners(currentUserRole, userId);
+        }
+
+        async function handleProfileUpdate(isFirstTime) {
+            const name = document.getElementById('profile-name').value.trim();
+            const empId = document.getElementById('profile-empId').value.trim();
+            const designation = document.getElementById('profile-designation').value.trim();
+            
+            if (!name || !empId || !designation) {
+                showToast("Please fill in all profile fields.", true);
+                return;
+            }
+            
+            const userRoleRef = doc(getUserRolesCollection(), currentUserId);
+            try {
+                await updateDoc(userRoleRef, {
+                    name: name,
+                    empId: empId,
+                    designation: designation
+                });
+                
+                // Update local profile
+                currentUserProfile = { ...currentUserProfile, name, empId, designation };
+                showToast("Profile updated successfully!");
+                
+                if (isFirstTime) {
+                    // First time setup, now log them in properly
+                    await checkUserRoleAndProfile(auth.currentUser);
+                } else {
+                    // Just a normal update, go back to the main app
+                    showView('app-container');
+                }
+
+            } catch (error) {
+                console.error("Profile update error:", error);
+                showToast("Failed to update profile.", true);
+            }
         }
         
         async function handleRegister() {
             const email = document.getElementById('register-email').value;
             const password = document.getElementById('register-password').value;
-            
             if (!email || !password) {
                 showAuthError("Please enter both email and password.");
                 return;
             }
-            
             try {
                 showAuthLoading(true);
                 await createUserWithEmailAndPassword(auth, email, password);
-                // onAuthStateChanged will handle the rest (login, role check, UI switch)
                 showAuthLoading(false);
-                showAuthError(""); // Clear any old errors
+                showAuthError("");
             } catch (error) {
                 console.error("Registration Error:", error);
                 showAuthError(getFriendlyAuthError(error));
@@ -154,18 +211,15 @@
         async function handleLogin() {
             const email = document.getElementById('login-email').value;
             const password = document.getElementById('login-password').value;
-            
             if (!email || !password) {
                 showAuthError("Please enter both email and password.");
                 return;
             }
-
             try {
                 showAuthLoading(true);
                 await signInWithEmailAndPassword(auth, email, password);
-                // onAuthStateChanged will handle the rest
                 showAuthLoading(false);
-                showAuthError(""); // Clear any old errors
+                showAuthError("");
             } catch (error) {
                 console.error("Login Error:", error);
                 showAuthError(getFriendlyAuthError(error));
@@ -175,47 +229,32 @@
 
         async function handleLogout() {
             await signOut(auth);
-            // This will trigger onAuthStateChanged, which will clear state and show login view
         }
         
         function getFriendlyAuthError(error) {
             switch (error.code) {
-                case 'auth/invalid-email':
-                    return 'Please enter a valid email address.';
+                case 'auth/invalid-email': return 'Please enter a valid email address.';
                 case 'auth/user-not-found':
                 case 'auth/wrong-password':
-                case 'auth/invalid-credential':
-                    return 'Invalid email or password.';
-                case 'auth/email-already-in-use':
-                    return 'This email is already registered. Please log in.';
-                case 'auth/weak-password':
-                    return 'Password should be at least 6 characters.';
-                default:
-                    return 'An error occurred. Please try again.';
+                case 'auth/invalid-credential': return 'Invalid email or password.';
+                case 'auth/email-already-in-use': return 'This email is already registered. Please log in.';
+                case 'auth/weak-password': return 'Password should be at least 6 characters.';
+                default: return 'An error occurred. Please try again.';
             }
         }
 
         // --- 3. UI & VIEW MANAGEMENT ---
         function showView(viewId) {
-            // Hide all main views
-            ['loading-view', 'login-view', 'app-container'].forEach(id => {
+            ['loading-view', 'login-view', 'app-container', 'profile-setup-view'].forEach(id => {
                 document.getElementById(id).classList.add('hidden');
             });
-            // Show the target view
             document.getElementById(viewId).classList.remove('hidden');
         }
         
         function toggleAuthForms(showRegister) {
-            const loginForm = document.getElementById('login-form');
-            const registerForm = document.getElementById('register-form');
-            if (showRegister) {
-                loginForm.classList.add('hidden');
-                registerForm.classList.remove('hidden');
-            } else {
-                loginForm.classList.remove('hidden');
-                registerForm.classList.add('hidden');
-            }
-            showAuthError(""); // Clear errors on toggle
+            document.getElementById('login-form').classList.toggle('hidden', showRegister);
+            document.getElementById('register-form').classList.toggle('hidden', !showRegister);
+            showAuthError("");
         }
         
         function showAuthError(message) {
@@ -237,25 +276,28 @@
             if (role === 'manager') {
                 document.getElementById('user-interface').classList.add('hidden');
                 document.getElementById('manager-interface').classList.remove('hidden');
-                showManagerTab('dashboard'); // Default manager tab
+                document.getElementById('manager-nav').classList.remove('hidden');
+                document.getElementById('user-nav').classList.add('hidden');
+                showManagerTab('dashboard-tab');
             } else {
                 document.getElementById('user-interface').classList.remove('hidden');
                 document.getElementById('manager-interface').classList.add('hidden');
-                showUserPage('user-inventory-page'); // Default user page
+                document.getElementById('manager-nav').classList.add('hidden');
+                document.getElementById('user-nav').classList.remove('hidden');
+                showUserPage('user-inventory-page');
             }
+            // Reset common pages
+            document.getElementById('user-profile-page').classList.add('hidden');
         }
         
         function showUserPage(pageId) {
-            // Hide all user pages
-            ['user-inventory-page', 'user-cart-page', 'user-checkout-page'].forEach(id => {
+            ['user-inventory-page', 'user-cart-page', 'user-checkout-page', 'user-orders-page', 'order-summary-page', 'user-profile-page'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.classList.add('hidden');
             });
-            // Show the target page
             const targetEl = document.getElementById(pageId);
             if (targetEl) targetEl.classList.remove('hidden');
             
-            // Update nav button styles
             document.querySelectorAll('#user-nav button').forEach(btn => {
                 if (btn.getAttribute('data-page') === pageId) {
                     btn.classList.add('bg-blue-100', 'text-blue-700', 'shadow-inner');
@@ -266,33 +308,32 @@
                 }
             });
 
-            if (pageId === 'user-checkout-page') {
-                renderCheckoutPage();
-            }
+            if (pageId === 'user-checkout-page') renderCheckoutPage();
+            if (pageId === 'user-profile-page') renderProfilePage(false);
         }
 
         function showManagerTab(tabId) {
-            // Hide all manager tabs
-            ['dashboard-tab', 'inventory-mgt-tab', 'user-mgt-tab'].forEach(id => {
+            ['dashboard-tab', 'inventory-mgt-tab', 'user-mgt-tab', 'manager-orders-tab', 'user-profile-page'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.classList.add('hidden');
             });
-            // Deactivate all tab buttons
-            document.querySelectorAll('#manager-nav button').forEach(btn => {
-                btn.classList.replace('bg-blue-700', 'bg-gray-700');
-                btn.classList.add('hover:bg-blue-600');
-                btn.classList.remove('shadow-lg', 'ring-2', 'ring-blue-300');
-            });
-            // Show the target tab and activate its button
-            const activeBtn = document.querySelector(`button[onclick="showManagerTab('${tabId}')"]`);
-            if (activeBtn) {
-                activeBtn.classList.replace('bg-gray-700', 'bg-blue-700');
-                activeBtn.classList.remove('hover:bg-blue-600');
-                activeBtn.classList.add('shadow-lg', 'ring-2', 'ring-blue-300');
-            }
             
-            const targetTab = document.getElementById(tabId + '-tab');
+            document.querySelectorAll('#manager-nav button').forEach(btn => {
+                if (btn.getAttribute('data-tab') === tabId) {
+                    btn.classList.replace('bg-gray-700', 'bg-blue-700');
+                    btn.classList.add('shadow-lg', 'ring-2', 'ring-blue-300');
+                    btn.classList.remove('hover:bg-blue-600');
+                } else {
+                    btn.classList.replace('bg-blue-700', 'bg-gray-700');
+                    btn.classList.add('hover:bg-blue-600');
+                    btn.classList.remove('shadow-lg', 'ring-2', 'ring-blue-300');
+                }
+            });
+            
+            const targetTab = document.getElementById(tabId);
             if (targetTab) targetTab.classList.remove('hidden');
+
+            if (tabId === 'user-profile-page') renderProfilePage(false);
         }
         
         function showToast(message, isError = false) {
@@ -300,17 +341,11 @@
             if (!toast) return;
             toast.textContent = message;
             toast.classList.remove('hidden', 'opacity-0');
-            if (isError) {
-                toast.classList.add('bg-red-600');
-                toast.classList.remove('bg-green-600');
-            } else {
-                toast.classList.add('bg-green-600');
-                toast.classList.remove('bg-red-600');
-            }
-            // Fade out after 3 seconds
+            toast.classList.toggle('bg-red-600', isError);
+            toast.classList.toggle('bg-green-600', !isError);
             setTimeout(() => {
                 toast.classList.add('opacity-0');
-                setTimeout(() => toast.classList.add('hidden'), 500); // Wait for transition
+                setTimeout(() => toast.classList.add('hidden'), 500);
             }, 3000);
         }
 
@@ -319,16 +354,16 @@
             // 1. Listen to Inventory (all users)
             const inventoryQuery = query(getInventoryCollection());
             unsubscribeInventory = onSnapshot(inventoryQuery, (snapshot) => {
-                const inventory = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                // Sort data in memory
-                inventory.sort((a, b) => a.name.localeCompare(b.name));
+                inventoryCache = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                inventoryCache.sort((a, b) => a.name.localeCompare(b.name));
                 
                 if (role === 'user') {
-                    renderUserInventory(inventory);
+                    renderUserInventory(inventoryCache);
+                    renderUserCart(localCartCache, inventoryCache); // Re-render cart with fresh names
                 }
                 if (role === 'manager') {
-                    renderManagerInventory(inventory);
-                    renderDashboard(inventory);
+                    renderManagerInventory(inventoryCache);
+                    renderDashboard(inventoryCache);
                 }
             }, (error) => console.error("Inventory listener error:", error));
 
@@ -336,46 +371,47 @@
             if (role === 'user') {
                 const cartQuery = query(getUserCartCollection(userId));
                 unsubscribeCart = onSnapshot(cartQuery, (snapshot) => {
-                    const cart = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    localCartCache = cart; // Update local cache
-                    renderUserCart(cart);
+                    localCartCache = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    renderUserCart(localCartCache, inventoryCache);
                 }, (error) => console.error("Cart listener error:", error));
             }
+            
+            // 3. Listen to User Orders (only for regular users)
+            if (role === 'user') {
+                const userOrdersQuery = query(getOrdersCollection(), where('userId', '==', userId), orderBy('createdAt', 'desc'));
+                unsubscribeUserOrders = onSnapshot(userOrdersQuery, (snapshot) => {
+                    const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    renderUserOrders(orders, inventoryCache);
+                }, (error) => console.error("User orders listener error:", error));
+            }
 
-            // 3. Listen to User Roles (only for managers)
+            // 4. Listen to User Roles & All Orders (only for managers)
             if (role === 'manager') {
+                // User Roles
                 const usersQuery = query(getUserRolesCollection());
                 unsubscribeUserRoles = onSnapshot(usersQuery, (snapshot) => {
                     const users = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     renderUserRoles(users);
                 }, (error) => console.error("User roles listener error:", error));
+                
+                // All Orders
+                const allOrdersQuery = query(getOrdersCollection(), orderBy('createdAt', 'desc'));
+                unsubscribeManagerOrders = onSnapshot(allOrdersQuery, (snapshot) => {
+                    const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    renderManagerOrders(orders, inventoryCache);
+                }, (error) => console.error("Manager orders listener error:", error));
             }
-            
-            // 4. Listen to Orders (only for managers)
-            // (Functionality not fully built out in UI, but listener is here)
-            // if (role === 'manager') {
-            //     const ordersQuery = query(getOrdersCollection(), orderBy('createdAt', 'desc'));
-            //     unsubscribeOrders = onSnapshot(ordersQuery, (snapshot) => {
-            //         const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-            //         // renderOrders(orders); // <-- Function to build in dashboard
-            //     }, (error) => console.error("Orders listener error:", error));
-            // }
         }
 
         function unsubscribeAll() {
             unsubscribeInventory();
             unsubscribeCart();
-            unsubscribeOrders();
+            unsubscribeUserOrders();
+            unsubscribeManagerOrders();
             unsubscribeUserRoles();
         }
 
-
         // --- 5. REGULAR USER: ACTIONS & RENDERING ---
-        
-        // Cache for cart data to use on checkout page
-        let localCartCache = [];
-
-        // --- REGULAR USER: ACTIONS ---
         async function handleAddToCart(itemId, itemName, maxStock) {
             if (maxStock <= 0) {
                 showToast("Item is out of stock.", true);
@@ -389,18 +425,15 @@
                     const cartItemDoc = await transaction.get(cartItemRef);
                     
                     if (cartItemDoc.exists()) {
-                        // Item already in cart, update quantity
                         const newQuantity = cartItemDoc.data().quantity + 1;
                         if (newQuantity > maxStock) {
-                            // We can't use showToast from in here, so we throw an error
                             throw new Error("Cannot add more than available stock.");
                         }
                         transaction.update(cartItemRef, { quantity: newQuantity });
                     } else {
-                        // New item, add to cart
                         transaction.set(cartItemRef, {
-                            productId: itemId,
-                            productName: itemName,
+                            productId: itemId, // Store ID for future reference
+                            productName: itemName, // Store name at time of add
                             quantity: 1,
                             addedAt: serverTimestamp()
                         });
@@ -416,14 +449,11 @@
         async function handleUpdateCartQuantity(itemId, newQuantity) {
             const cartItemRef = doc(getUserCartCollection(currentUserId), itemId);
             if (newQuantity <= 0) {
-                // Remove item if quantity is 0 or less
                 await deleteDoc(cartItemRef);
                 showToast("Item removed from cart.");
             } else {
-                // Check against max stock
-                const inventoryItemRef = doc(getInventoryCollection(), itemId);
-                const inventoryDoc = await getDoc(inventoryItemRef);
-                if (inventoryDoc.exists() && newQuantity > inventoryDoc.data().stock) {
+                const inventoryItem = inventoryCache.find(item => item.id === itemId);
+                if (inventoryItem && newQuantity > inventoryItem.stock) {
                     showToast("Cannot add more than available stock.", true);
                 } else {
                     await updateDoc(cartItemRef, { quantity: newQuantity });
@@ -443,57 +473,102 @@
             checkoutButton.disabled = true;
             checkoutButton.textContent = "Submitting...";
 
-            const remarksInputs = document.querySelectorAll('.checkout-remarks-input');
-            const itemsWithRemarks = localCartCache.map(item => {
-                const input = document.getElementById(`remarks-${item.id}`);
-                return {
-                    ...item,
-                    remarks: input ? input.value : ""
-                };
-            });
+            const supervisorName = document.getElementById('supervisor-name').value.trim();
+            if (!supervisorName) {
+                showToast("Please enter the supervisor's name.", true);
+                checkoutButton.disabled = false;
+                checkoutButton.textContent = "Confirm Order";
+                return;
+            }
+            
+            // Build the items array with new detailed info
+            const itemsWithDetails = [];
+            let formIsValid = true;
+            for (const item of localCartCache) {
+                const type = document.querySelector(`input[name="type-${item.id}"]:checked`)?.value;
+                let individualInfo = null;
+                
+                if (type === 'individual') {
+                    const forWho = document.querySelector(`input[name="for-${item.id}"]:checked`)?.value;
+                    if (forWho === 'self') {
+                        individualInfo = {
+                            name: currentUserProfile.name,
+                            empId: currentUserProfile.empId,
+                            designation: currentUserProfile.designation
+                        };
+                    } else if (forWho === 'other') {
+                        const name = document.getElementById(`name-${item.id}`).value.trim();
+                        const empId = document.getElementById(`empId-${item.id}`).value.trim();
+                        const designation = document.getElementById(`desg-${item.id}`).value.trim();
+                        
+                        if (!name || !designation) {
+                            formIsValid = false;
+                            showToast(`Please fill in all details for "${item.productName}".`, true);
+                            break;
+                        }
+                        individualInfo = { name, empId, designation };
+                    }
+                }
+                
+                if (!type) {
+                    formIsValid = false;
+                    showToast(`Please select a type for "${item.productName}".`, true);
+                    break;
+                }
 
-            if (itemsWithRemarks.length === 0) {
+                itemsWithDetails.push({
+                    ...item, // contains productId, productName, quantity
+                    type: type,
+                    individualInfo: individualInfo, // null if type is 'operations'
+                    remarks: document.getElementById(`remarks-${item.id}`).value.trim()
+                });
+            }
+            
+            if (!formIsValid) {
+                checkoutButton.disabled = false;
+                checkoutButton.textContent = "Confirm Order";
+                return;
+            }
+
+            if (itemsWithDetails.length === 0) {
                 showToast("Your cart is empty.", true);
                 checkoutButton.disabled = false;
                 checkoutButton.textContent = "Confirm Order";
                 return;
             }
 
+            // This object will be saved to Firestore
+            const newOrder = {
+                userId: currentUserId,
+                userProfile: currentUserProfile, // Save a snapshot of the user's profile
+                status: "pending",
+                createdAt: serverTimestamp(),
+                supervisorName: supervisorName,
+                items: itemsWithDetails
+            };
+
             try {
-                // Use a transaction to ensure stock is updated and order is created atomically
                 await runTransaction(db, async (transaction) => {
-                    const inventoryUpdates = [];
-                    
-                    // 1. Check stock for all items
-                    for (const item of itemsWithRemarks) {
+                    for (const item of itemsWithDetails) {
                         const inventoryRef = doc(getInventoryCollection(), item.productId);
                         const inventoryDoc = await transaction.get(inventoryRef);
                         
-                        if (!inventoryDoc.exists()) {
-                            throw new Error(`Item "${item.productName}" not found.`);
-                        }
+                        if (!inventoryDoc.exists()) throw new Error(`Item "${item.productName}" not found.`);
                         
                         const currentStock = inventoryDoc.data().stock;
                         if (currentStock < item.quantity) {
                             throw new Error(`Not enough stock for "${item.productName}". Only ${currentStock} left.`);
                         }
                         
-                        // Prepare update
                         const newStock = currentStock - item.quantity;
                         transaction.update(inventoryRef, { stock: newStock });
                     }
-                    
-                    // 2. Create the order
-                    const orderRef = doc(getOrdersCollection());
-                    transaction.set(orderRef, {
-                        userId: currentUserId,
-                        status: "pending",
-                        createdAt: serverTimestamp(),
-                        items: itemsWithRemarks
-                    });
                 });
-                
-                // 3. Clear the user's cart (outside the transaction, in a batch)
+
+                // Transaction succeeded, now create the order
+                const orderRef = await addDoc(getOrdersCollection(), newOrder);
+
+                // Clear the user's cart
                 const batch = writeBatch(db);
                 localCartCache.forEach(item => {
                     const cartItemRef = doc(getUserCartCollection(currentUserId), item.id);
@@ -501,9 +576,11 @@
                 });
                 await batch.commit();
 
-                // 4. Success
+                // Success
                 showToast("Order submitted successfully!");
-                showUserPage('user-inventory-page'); // Go back to inventory
+                lastOrderCache = { id: orderRef.id, ...newOrder }; // Save for summary page
+                renderOrderSummaryPage(lastOrderCache, true); // true = just created
+                showUserPage('order-summary-page');
                 
             } catch (error) {
                 console.error("Order submission error: ", error);
@@ -513,8 +590,111 @@
                 checkoutButton.textContent = "Confirm Order";
             }
         }
+        
+        async function handleCopySummary() {
+            if (!lastOrderCache) return;
+            
+            const { id, createdAt, supervisorName, userProfile, items } = lastOrderCache;
+            
+            let summaryText = `** Hubli - StoreInsights: Order Summary **\n\n`;
+            summaryText += `Order ID: ${id}\n`;
+            summaryText += `Date: ${new Date().toLocaleString()}\n`;
+            summaryText += `Status: Pending\n\n`;
+            
+            summaryText += `**Requested By:**\n`;
+            summaryText += `Name: ${userProfile.name}\n`;
+            summaryText += `Employee ID: ${userProfile.empId}\n`;
+            summaryText += `Designation: ${userProfile.designation}\n\n`;
+            
+            summaryText += `**Withdrawal Supervised By:**\n${supervisorName}\n\n`;
+            
+            summaryText += `**Items Requested (${items.length}):**\n`;
+            summaryText += `---------------------------------\n`;
+            
+            items.forEach((item, index) => {
+                const currentItem = inventoryCache.find(inv => inv.id === item.productId);
+                const currentName = currentItem ? currentItem.name : item.productName;
+                
+                summaryText += `${index + 1}. ${currentName} (Qty: ${item.quantity})\n`;
+                summaryText += `   Type: ${item.type}\n`;
+                if (item.individualInfo) {
+                    summaryText += `   For: ${item.individualInfo.name} (${item.individualInfo.designation})\n`;
+                }
+                if (item.remarks) {
+                    summaryText += `   Remarks: ${item.remarks}\n`;
+                }
+                summaryText += `\n`;
+            });
+            
+            // Fallback for clipboard
+            const textArea = document.createElement("textarea");
+            textArea.value = summaryText;
+            textArea.style.position = "fixed"; //-remove from view
+            textArea.style.left = "-9999px";
+            textArea.style.top = "-9999px";
+            document.body.appendChild(textArea);
+            textArea.focus();
+            textArea.select();
+            try {
+                document.execCommand('copy');
+                showToast("Summary copied to clipboard!");
+            } catch (err) {
+                showToast("Could not copy summary.", true);
+            }
+            document.body.removeChild(textArea);
+        }
 
         // --- REGULAR USER: RENDER ---
+        function renderProfilePage(isFirstTime = false) {
+            const container = document.getElementById('user-profile-page');
+            const setupContainer = document.getElementById('profile-setup-view');
+
+            const targetContainer = isFirstTime ? setupContainer : container;
+            if (!targetContainer) return;
+            
+            const title = isFirstTime ? "Welcome! Let's set up your profile." : "My Profile";
+            const buttonText = isFirstTime ? "Save and Continue" : "Update Profile";
+            
+            // Populate fields if profile exists
+            const name = currentUserProfile?.name || '';
+            const empId = currentUserProfile?.empId || '';
+            const designation = currentUserProfile?.designation || '';
+            const email = currentUserEmail || '';
+            
+            targetContainer.innerHTML = `
+                <div class="bg-white p-6 md:p-8 rounded-xl shadow-xl max-w-2xl mx-auto">
+                    <h2 class="text-2xl font-semibold mb-5">${title}</h2>
+                    ${isFirstTime ? '<p class="text-gray-600 mb-6">Please complete your profile to continue.</p>' : ''}
+                    
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Email Address</label>
+                            <input type="email" value="${email}" disabled class="mt-1 block w-full rounded-lg border-gray-300 bg-gray-100 shadow-sm sm:text-sm">
+                        </div>
+                        <div>
+                            <label for="profile-name" class="block text-sm font-medium text-gray-700">Full Name</label>
+                            <input type="text" id="profile-name" value="${name}" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm">
+                        </div>
+                        <div>
+                            <label for="profile-empId" class="block text-sm font-medium text-gray-700">Employee ID</label>
+                            <input type="text" id="profile-empId" value="${empId}" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm">
+                        </div>
+                        <div>
+                            <label for="profile-designation" class="block text-sm font-medium text-gray-700">Designation</label>
+                            <input type="text" id="profile-designation" value="${designation}" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm">
+                        </div>
+                        
+                        <button id="update-profile-btn" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 transition-all duration-200 shadow-md">
+                            ${buttonText}
+                        </button>
+                    </div>
+                </div>
+            `;
+            
+            // Add event listener to the new button
+            document.getElementById('update-profile-btn').onclick = () => handleProfileUpdate(isFirstTime);
+        }
+        
         function renderUserInventory(inventory) {
             const list = document.getElementById('user-inventory-list');
             if (!list) return;
@@ -546,7 +726,7 @@
             });
         }
 
-        function renderUserCart(cart) {
+        function renderUserCart(cart, inventory) {
             const list = document.getElementById('cart-items-list');
             const totalSpan = document.getElementById('cart-total');
             const checkoutBtn = document.getElementById('go-to-checkout-btn');
@@ -564,10 +744,14 @@
             } else {
                 cart.forEach(item => {
                     totalItems += item.quantity;
+                    const inventoryItem = inventory.find(inv => inv.id === item.productId);
+                    const currentName = inventoryItem ? inventoryItem.name : item.productName;
+                    const maxStock = inventoryItem ? inventoryItem.stock : item.quantity; // Use item.quantity as fallback
+                    
                     list.innerHTML += `
                         <div class="bg-white p-3 rounded-xl shadow-md flex justify-between items-center">
                             <div>
-                                <h4 class="font-semibold text-gray-800">${item.productName}</h4>
+                                <h4 class="font-semibold text-gray-800">${currentName}</h4>
                                 <div class="flex items-center gap-2 mt-2">
                                     <button onclick="handleUpdateCartQuantity('${item.id}', ${item.quantity - 1})" class="bg-gray-200 w-7 h-7 rounded-full font-bold text-lg text-gray-700 flex items-center justify-center transition-all hover:bg-gray-300">-</button>
                                     <span class="text-lg w-8 text-center">${item.quantity}</span>
@@ -591,6 +775,10 @@
         function renderCheckoutPage() {
             const list = document.getElementById('checkout-items-list');
             list.innerHTML = '';
+            
+            // Reset supervisor name
+            document.getElementById('supervisor-name').value = '';
+            
             if (localCartCache.length === 0) {
                  list.innerHTML = '<p class="text-gray-500">Your cart is empty. <a href="#" onclick="showUserPage(\'user-inventory-page\'); return false;" class="text-blue-500">Go shopping</a>.</p>';
                  document.getElementById('confirm-order-btn').disabled = true;
@@ -599,23 +787,177 @@
             
             document.getElementById('confirm-order-btn').disabled = false;
             localCartCache.forEach(item => {
+                const inventoryItem = inventoryCache.find(inv => inv.id === item.productId);
+                const currentName = inventoryItem ? inventoryItem.name : item.productName;
+                
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-md">
-                        <h4 class="text-lg font-semibold text-gray-800">${item.productName} (Qty: ${item.quantity})</h4>
-                        <label for="remarks-${item.id}" class="block text-sm font-medium text-gray-700 mt-3">Remarks:</label>
-                        <input type="text" id="remarks-${item.id}" 
-                               data-cart-item-id="${item.id}" 
-                               class="checkout-remarks-input mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200 sm:text-sm" 
-                               placeholder="Optional remarks (e.g., condition, location)">
+                    <div class="bg-white p-4 rounded-xl shadow-md space-y-4" id="item-form-${item.id}">
+                        <h4 class="text-lg font-semibold text-gray-800">${currentName} (Qty: ${item.quantity})</h4>
+                        
+                        <!-- Type Selection -->
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Type:</label>
+                            <div classs="mt-2 flex gap-4">
+                                <label class="flex items-center">
+                                    <input type="radio" name="type-${item.id}" value="operations" class="form-radio h-4 w-4 text-blue-600" onchange="toggleIndividualFields('${item.id}', false)">
+                                    <span class="ml-2 text-gray-700">Operations</span>
+                                </label>
+                                <label class="flex items-center ml-4">
+                                    <input type="radio" name="type-${item.id}" value="individual" class="form-radio h-4 w-4 text-blue-600" onchange="toggleIndividualFields('${item.id}', true)">
+                                    <span class="ml-2 text-gray-700">Individual</span>
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <!-- Individual Fields (hidden by default) -->
+                        <div id="individual-fields-${item.id}" class="hidden space-y-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
+                            <label class="block text-sm font-medium text-gray-700">For:</label>
+                            <div class="flex gap-4">
+                                <label class="flex items-center">
+                                    <input type="radio" name="for-${item.id}" value="self" checked class="form-radio h-4 w-4 text-blue-600" onchange="toggleIndividualNameFields('${item.id}', false)">
+                                    <span class="ml-2 text-gray-700">Self (auto-fill)</span>
+                                </label>
+                                <label class="flex items-center ml-4">
+                                    <input type="radio" name="for-${item.id}" value="other" class="form-radio h-4 w-4 text-blue-600" onchange="toggleIndividualNameFields('${item.id}', true)">
+                                    <span class="ml-2 text-gray-700">Other Person</span>
+                                </label>
+                            </div>
+                            
+                            <div id="other-person-fields-${item.id}" class="hidden space-y-3">
+                                <input type="text" id="name-${item.id}" placeholder="Full Name" class="block w-full rounded-lg border-gray-300 sm:text-sm">
+                                <input type="text" id="desg-${item.id}" placeholder="Designation" class="block w-full rounded-lg border-gray-300 sm:text-sm">
+                                <input type="text" id="empId-${item.id}" placeholder="Employee ID (Optional)" class="block w-full rounded-lg border-gray-300 sm:text-sm">
+                            </div>
+                        </div>
+                        
+                        <!-- Remarks -->
+                        <div>
+                            <label for="remarks-${item.id}" class="block text-sm font-medium text-gray-700">Other Remarks:</label>
+                            <input type="text" id="remarks-${item.id}" class="checkout-remarks-input mt-1 block w-full rounded-lg border-gray-300 sm:text-sm" placeholder="Optional">
+                        </div>
                     </div>
                 `;
             });
+        }
+        
+        // --- Helper functions for checkout form ---
+        window.toggleIndividualFields = (itemId, show) => {
+            document.getElementById(`individual-fields-${itemId}`).classList.toggle('hidden', !show);
+        };
+        window.toggleIndividualNameFields = (itemId, show) => {
+            document.getElementById(`other-person-fields-${itemId}`).classList.toggle('hidden', !show);
+        };
+        
+        function renderOrderSummaryPage(order, justCreated) {
+            const list = document.getElementById('order-summary-details');
+            if (!order) {
+                list.innerHTML = '<p class="text-gray-600">Could not find order details.</p>';
+                return;
+            }
+            
+            // Show/hide copy button
+            document.getElementById('copy-summary-btn').classList.toggle('hidden', !justCreated);
+
+            // Format date
+            const orderDate = order.createdAt?.toDate ? order.createdAt.toDate().toLocaleString() : 'Just now';
+            
+            let itemsHtml = '';
+            order.items.forEach((item, index) => {
+                const currentItem = inventoryCache.find(inv => inv.id === item.productId);
+                const currentName = currentItem ? currentItem.name : item.productName;
+                
+                itemsHtml += `
+                    <div class="p-4 border border-gray-200 rounded-lg">
+                        <h5 class="font-semibold text-gray-800">${index + 1}. ${currentName} (Qty: ${item.quantity})</h5>
+                        <p class="text-sm text-gray-600 capitalize">Type: ${item.type}</p>
+                        ${item.individualInfo ? `
+                            <div class="pl-4 mt-2 text-sm">
+                                <p>For: ${item.individualInfo.name}</p>
+                                <p>${item.individualInfo.designation}</p>
+                                ${item.individualInfo.empId ? `<p>ID: ${item.individualInfo.empId}</p>` : ''}
+                            </div>
+                        ` : ''}
+                        ${item.remarks ? `<p class="text-sm text-gray-600 mt-2">Remarks: ${item.remarks}</p>` : ''}
+                    </div>
+                `;
+            });
+            
+            list.innerHTML = `
+                <div class="space-y-6">
+                    <div>
+                        <h3 class="text-lg font-semibold text-gray-900">Order ID:</h3>
+                        <p class="text-gray-700 text-sm font-mono">${order.id}</p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-gray-900">Date:</h3>
+                        <p class="text-gray-700">${orderDate}</p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-gray-900">Requested By:</h3>
+                        <p class="text-gray-700">${order.userProfile.name} (${order.userProfile.designation})</p>
+                        <p class="text-gray-700">ID: ${order.userProfile.empId}</p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-gray-900">Supervised By:</h3>
+                        <p class="text-gray-700">${order.supervisorName}</p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-gray-900">Items (${order.items.length}):</h3>
+                        <div class="space-y-3 mt-2">
+                            ${itemsHtml}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+        
+        function renderUserOrders(orders, inventory) {
+            const list = document.getElementById('user-orders-list');
+            if (!list) return;
+            list.innerHTML = '';
+            
+            if (orders.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">You have not placed any orders yet.</p>';
+                return;
+            }
+            
+            orders.forEach(order => {
+                const totalItems = order.items.reduce((sum, item) => sum + item.quantity, 0);
+                const orderDate = order.createdAt?.toDate ? order.createdAt.toDate().toLocaleDateString() : 'Pending';
+                
+                list.innerHTML += `
+                    <div class="bg-white p-4 rounded-xl shadow-lg transition-all duration-300 hover:shadow-xl">
+                        <div class="flex justify-between items-center">
+                            <div>
+                                <h3 class="text-lg font-semibold text-gray-800">Order ID: <span class="font-normal text-sm">${order.id}</span></h3>
+                                <p class="text-gray-600">Date: ${orderDate}</p>
+                                <p class="text-gray-600">Total Items: ${totalItems}</p>
+                            </div>
+                            <button onclick="viewOrderDetails('${order.id}')" class="bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-600">
+                                View
+                            </button>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            // Add viewOrderDetails to window
+            window.viewOrderDetails = async (orderId) => {
+                const orderRef = doc(getOrdersCollection(), orderId);
+                const orderDoc = await getDoc(orderRef);
+                if (orderDoc.exists()) {
+                    lastOrderCache = { id: orderDoc.id, ...orderDoc.data() };
+                    renderOrderSummaryPage(lastOrderCache, false); // false = not just created
+                    showUserPage('order-summary-page');
+                } else {
+                    showToast("Order not found.", true);
+                }
+            };
         }
 
 
         // --- 6. MANAGER: ACTIONS & RENDERING ---
         
-        // --- MANAGER: RENDER ---
         function renderDashboard(inventory) {
             const totalSpan = document.getElementById('dashboard-summary-total');
             const lowStockList = document.getElementById('low-stock-list');
@@ -653,17 +995,23 @@
 
             inventory.forEach(item => {
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-lg grid grid-cols-1 md:grid-cols-4 gap-4 items-center">
-                        <div class="md:col-span-2">
-                            <h3 class="text-lg font-semibold text-gray-800">${item.name}</h3>
-                            <p class="text-sm text-gray-500">ID: ${item.id}</p>
+                    <div class="bg-white p-4 rounded-xl shadow-lg space-y-3">
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <div>
+                                <label for="name-${item.id}" class="text-xs font-medium text-gray-600">Item Name</label>
+                                <input type="text" id="name-${item.id}" value="${item.name}" class="mt-1 w-full p-2 border border-gray-300 rounded-lg">
+                            </div>
+                             <div>
+                                <label for="stock-${item.id}" class="text-xs font-medium text-gray-600">Stock</label>
+                                <input type="number" id="stock-${item.id}" value="${item.stock}" class="mt-1 w-full p-2 border border-gray-300 rounded-lg">
+                            </div>
+                             <div>
+                                <label for="lowstock-${item.id}" class="text-xs font-medium text-gray-600">Low Stock At</label>
+                                <input type="number" id="lowstock-${item.id}" value="${item.lowStockThreshold}" class="mt-1 w-full p-2 border border-gray-300 rounded-lg">
+                            </div>
                         </div>
-                        <div class="flex items-center gap-2">
-                            <label for="stock-${item.id}" class="text-sm font-medium text-gray-700">Stock:</label>
-                            <input type="number" id="stock-${item.id}" value="${item.stock}" class="w-24 p-2 border border-gray-300 rounded-lg focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
-                        </div>
-                        <button onclick="handleUpdateStock('${item.id}')" class="bg-blue-500 text-white py-2 px-4 rounded-lg hover:bg-blue-600 font-semibold shadow-md transition-all duration-200 hover:shadow-lg transform hover:-translate-y-0.5">
-                            Update
+                        <button onclick="handleUpdateInventoryItem('${item.id}')" class="w-full md:w-auto bg-blue-500 text-white py-2 px-4 rounded-lg hover:bg-blue-600 font-semibold shadow-md transition-all">
+                            Save Changes
                         </button>
                     </div>
                 `;
@@ -680,16 +1028,17 @@
                 list.innerHTML += `
                     <div class="bg-white p-4 rounded-xl shadow-lg flex flex-col md:flex-row justify-between md:items-center gap-4">
                         <div class="mb-2 md:mb-0 flex-1">
-                            <p class-><span class="font-medium text-gray-800">Email:</span> ${user.email || 'N/A'}</p>
+                            <p class="font-semibold text-gray-800">${user.name || 'Profile Not Setup'}</p>
+                            <p class="text-sm text-gray-600">${user.email || 'N/A'}</p>
                             <p class="text-sm text-gray-600 break-all"><span class="font-medium">User ID:</span> ${user.userId}</p>
                         </div>
                         <div class="flex items-center gap-3">
-                            <select id="role-${user.id}" class="p-2 border border-gray-300 rounded-lg focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200" ${isCurrentUser ? 'disabled' : ''}>
+                            <select id="role-${user.id}" class="p-2 border border-gray-300 rounded-lg" ${isCurrentUser ? 'disabled' : ''}>
                                 <option value="user" ${user.role === 'user' ? 'selected' : ''}>Regular User</option>
                                 <option value="manager" ${user.role === 'manager' ? 'selected' : ''}>Manager</option>
                             </select>
                             <button onclick="handleUpdateUserRole('${user.id}')" 
-                                class="${isCurrentUser ? 'bg-gray-300 cursor-not-allowed' : 'bg-blue-500 hover:bg-blue-600'} text-white py-2 px-4 rounded-lg font-semibold shadow-md transition-all duration-200 hover:shadow-lg transform hover:-translate-y-0.5"
+                                class="${isCurrentUser ? 'bg-gray-300 cursor-not-allowed' : 'bg-blue-500 hover:bg-blue-600'} text-white py-2 px-4 rounded-lg font-semibold"
                                 ${isCurrentUser ? 'disabled' : ''}>
                                 Save
                             </button>
@@ -697,6 +1046,55 @@
                     </div>
                 `;
             });
+        }
+        
+        function renderManagerOrders(orders, inventory) {
+            const list = document.getElementById('manager-orders-list');
+            if (!list) return;
+            list.innerHTML = '';
+            
+            if (orders.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">No orders have been placed yet.</p>';
+                return;
+            }
+            
+            orders.forEach(order => {
+                const totalItems = order.items.reduce((sum, item) => sum + item.quantity, 0);
+                const orderDate = order.createdAt?.toDate ? order.createdAt.toDate().toLocaleString() : 'Pending';
+                
+                list.innerHTML += `
+                    <div class="bg-white p-4 rounded-xl shadow-lg transition-all duration-300 hover:shadow-xl">
+                        <div class="flex justify-between items-center">
+                            <div>
+                                <h3 class="text-lg font-semibold text-gray-800">${order.userProfile?.name || 'Unknown User'}</h3>
+                                <p class="text-gray-600 text-sm">ID: ${order.id}</p>
+                                <p class="text-gray-600">${orderDate}</p>
+                                <p class="text-gray-600">Total Items: ${totalItems}</p>
+                            </div>
+                            <button onclick="viewManagerOrderDetails('${order.id}')" class="bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-600">
+                                View
+                            </button>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            // Add viewManagerOrderDetails to window
+            window.viewManagerOrderDetails = async (orderId) => {
+                const orderRef = doc(getOrdersCollection(), orderId);
+                const orderDoc = await getDoc(orderRef);
+                if (orderDoc.exists()) {
+                    lastOrderCache = { id: orderDoc.id, ...orderDoc.data() };
+                    renderOrderSummaryPage(lastOrderCache, false); // false = not just created
+                    // Need a way to show summary page in manager view
+                    // For now, let's just re-use the user-page
+                    document.getElementById('manager-interface').classList.add('hidden');
+                    document.getElementById('user-interface').classList.remove('hidden');
+                    showUserPage('order-summary-page');
+                } else {
+                    showToast("Order not found.", true);
+                }
+            };
         }
         
         // --- MANAGER: ACTIONS ---
@@ -718,7 +1116,6 @@
                     addedAt: serverTimestamp()
                 });
                 showToast("Item added to inventory.");
-                // Clear form
                 document.getElementById('item-name').value = '';
                 document.getElementById('item-stock').value = '10';
                 document.getElementById('item-low-stock').value = '5';
@@ -728,22 +1125,27 @@
             }
         }
         
-        async function handleUpdateStock(itemId) {
-            const stockInput = document.getElementById(`stock-${itemId}`);
-            const newStock = parseInt(stockInput.value, 10);
+        async function handleUpdateInventoryItem(itemId) {
+            const name = document.getElementById(`name-${itemId}`).value.trim();
+            const stock = parseInt(document.getElementById(`stock-${itemId}`).value, 10);
+            const lowStock = parseInt(document.getElementById(`lowstock-${itemId}`).value, 10);
             
-            if (isNaN(newStock) || newStock < 0) {
-                showToast("Please enter a valid stock number.", true);
+            if (!name || isNaN(stock) || stock < 0 || isNaN(lowStock) || lowStock < 0) {
+                showToast("Please enter valid details for the item.", true);
                 return;
             }
             
             const itemRef = doc(getInventoryCollection(), itemId);
             try {
-                await updateDoc(itemRef, { stock: newStock });
-                showToast("Stock updated successfully.");
+                await updateDoc(itemRef, { 
+                    name: name,
+                    stock: stock,
+                    lowStockThreshold: lowStock
+                });
+                showToast("Item updated successfully.");
             } catch (error) {
-                console.error("Update stock error: ", error);
-                showToast("Failed to update stock.", true);
+                console.error("Update item error: ", error);
+                showToast("Failed to update item.", true);
             }
         }
         
@@ -768,46 +1170,35 @@
         
         // --- 7. EVENT LISTENERS ---
         function setupStaticEventListeners() {
-            // Logout button
             document.querySelector('button[onclick="handleLogout()"]').addEventListener('click', handleLogout);
             
             // User Nav
             document.querySelectorAll('#user-nav button').forEach(btn => {
-                btn.addEventListener('click', () => showUserPage(btn.dataset.page));
+                btn.addEventListener('click', () => {
+                    const page = btn.dataset.page;
+                    if (page) showUserPage(page);
+                });
             });
             
-            // Go to Checkout Button
             document.getElementById('go-to-checkout-btn').addEventListener('click', () => showUserPage('user-checkout-page'));
 
             // Manager Nav
             document.querySelectorAll('#manager-nav button').forEach(btn => {
-                const tab = btn.getAttribute('onclick').match(/'(.*?)'/)[1];
-                btn.addEventListener('click', () => showManagerTab(tab));
+                btn.addEventListener('click', () => {
+                    const tab = btn.dataset.tab;
+                    if (tab) showManagerTab(tab);
+                });
             });
             
-            // Manager Add Item
             document.querySelector('button[onclick="handleAddInventoryItem()"]').addEventListener('click', handleAddInventoryItem);
-            
-            // Confirm Order
             document.getElementById('confirm-order-btn').addEventListener('click', handleSubmitOrder);
+            document.getElementById('copy-summary-btn').addEventListener('click', handleCopySummary);
             
-            // --- NEW AUTH LISTENERS ---
-            document.getElementById('login-form').addEventListener('submit', (e) => {
-                e.preventDefault();
-                handleLogin();
-            });
-            document.getElementById('register-form').addEventListener('submit', (e) => {
-                e.preventDefault();
-                handleRegister();
-            });
-            document.getElementById('toggle-to-register').addEventListener('click', (e) => {
-                e.preventDefault();
-                toggleAuthForms(true);
-            });
-            document.getElementById('toggle-to-login').addEventListener('click', (e) => {
-                e.preventDefault();
-                toggleAuthForms(false);
-            });
+            // Auth Listeners
+            document.getElementById('login-form').addEventListener('submit', (e) => { e.preventDefault(); handleLogin(); });
+            document.getElementById('register-form').addEventListener('submit', (e) => { e.preventDefault(); handleRegister(); });
+            document.getElementById('toggle-to-register').addEventListener('click', (e) => { e.preventDefault(); toggleAuthForms(true); });
+            document.getElementById('toggle-to-login').addEventListener('click', (e) => { e.preventDefault(); toggleAuthForms(false); });
         }
 
         // --- 8. GLOBAL EXPORTS & INITIALIZATION ---
@@ -815,32 +1206,26 @@
         window.handleAddToCart = handleAddToCart;
         window.handleUpdateCartQuantity = handleUpdateCartQuantity;
         window.handleRemoveFromCart = handleRemoveFromCart;
-        window.handleUpdateStock = handleUpdateStock;
+        window.handleUpdateInventoryItem = handleUpdateInventoryItem;
         window.handleUpdateUserRole = handleUpdateUserRole;
         window.handleLogout = handleLogout;
         window.showUserPage = showUserPage;
         window.showManagerTab = showManagerTab;
 
-        // Start the application
         document.addEventListener('DOMContentLoaded', () => {
             initializeFirebase();
-            setupStaticEventListeners(); // Setup all static button clicks
+            setupStaticEventListeners();
         });
         
     </script>
 
     <!-- Custom Styles -->
     <style>
-        /* Add a subtle fade-in for loaded views */
-        #app-container, #login-view {
+        #app-container, #login-view, #profile-setup-view {
             animation: fadeIn 0.5s ease-in-out;
         }
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
         
-        /* Simple spinner */
         .spinner {
             border: 2px solid rgba(0, 0, 0, 0.1);
             border-left-color: #ffffff;
@@ -849,39 +1234,48 @@
             height: 16px;
             animation: spin 1s linear infinite;
         }
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        
+        /* Add some extra style for icons */
+        .icon-cart::before { content: '🛒'; margin-right: 8px; }
+        .icon-shop::before { content: '🛍️'; margin-right: 8px; }
+        .icon-orders::before { content: '🧾'; margin-right: 8px; }
+        .icon-profile::before { content: '👤'; margin-right: 8px; }
+        .icon-dashboard::before { content: '📊'; margin-right: 8px; }
+        .icon-inventory::before { content: '📦'; margin-right: 8px; }
+        .icon-users::before { content: '👥'; margin-right: 8px; }
+        
     </style>
 </head>
 
-<body class="bg-gray-200">
+<body class="bg-gray-200 min-h-screen flex flex-col">
 
     <!-- Loading View -->
     <div id="loading-view" class="flex items-center justify-center min-h-screen">
         <div class="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-blue-500"></div>
     </div>
 
-    <!-- Login View (placeholder) -->
-    <div id="login-view" class="hidden flex items-center justify-center min-h-screen p-4">
+    <!-- Login View -->
+    <div id="login-view" class="hidden flex-grow flex items-center justify-center p-4">
         <div class="w-full max-w-md">
-            <h1 class="text-4xl font-extrabold text-blue-800 text-center mb-6">InventoryPro</h1>
+            <h1 class="text-4xl font-extrabold text-blue-800 text-center mb-2">Hubli - StoreInsights</h1>
+            <p class="text-center text-gray-600 mb-6">Your friendly neighborhood store, digitized.</p>
             
             <!-- Login Form -->
             <form id="login-form" class="p-8 bg-white rounded-xl shadow-xl space-y-4">
                 <h2 class="text-2xl font-bold text-gray-800 text-center">Login</h2>
                 <div>
                     <label for="login-email" class="block text-sm font-medium text-gray-700">Email</label>
-                    <input type="email" id="login-email" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                    <input type="email" id="login-email" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
                 </div>
                 <div>
                     <label for="login-password" class="block text-sm font-medium text-gray-700">Password</label>
-                    <input type="password" id="login-password" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                    <input type="password" id="login-password" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
                 </div>
                 
                 <div id="auth-error-message" class="hidden text-sm text-red-600 font-medium"></div>
 
-                <button id="login-button" type="submit" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 transition-all duration-200 shadow-md flex items-center justify-center gap-2">
+                <button id="login-button" type="submit" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 transition-all shadow-md flex items-center justify-center gap-2">
                     <span id="login-spinner" class="spinner hidden"></span>
                     Login
                 </button>
@@ -895,17 +1289,15 @@
             <form id="register-form" class="hidden p-8 bg-white rounded-xl shadow-xl space-y-4">
                 <h2 class="text-2xl font-bold text-gray-800 text-center">Register</h2>
                 <div>
-                    <label for="register-email" class="block text-sm font-medium text-gray-700">Email</lebel>
-                    <input type="email" id="register-email" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                    <label for="register-email" class="block text-sm font-medium text-gray-700">Email</label>
+                    <input type="email" id="register-email" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
                 </div>
                 <div>
-                    <label for="register-password" class="block text-sm font-medium text-gray-700">Password (min. 6 characters)</lebel>
-                    <input type="password" id="register-password" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                    <label for="register-password" class="block text-sm font-medium text-gray-700">Password (min. 6 characters)</label>
+                    <input type="password" id="register-password" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
                 </div>
-                
-                <!-- Auth error message will be shown by the login form's error div -->
 
-                <button id="register-button" type="submit" class="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 transition-all duration-200 shadow-md flex items-center justify-center gap-2">
+                <button id="register-button" type="submit" class="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 transition-all shadow-md flex items-center justify-center gap-2">
                     <span id="register-spinner" class="spinner hidden"></span>
                     Register
                 </button>
@@ -917,11 +1309,19 @@
         </div>
     </div>
 
+    <!-- Profile Setup View -->
+    <div id="profile-setup-view" class="hidden flex-grow flex items-center justify-center p-4">
+        <!-- JS will render the profile form here -->
+    </div>
+
     <!-- Main App Container -->
-    <div id="app-container" class="hidden max-w-5xl mx-auto p-4 md:p-6">
+    <div id="app-container" class="hidden flex-grow max-w-5xl mx-auto p-4 md:p-6 w-full">
         <!-- Header -->
         <header class="flex flex-col md:flex-row justify-between md:items-center mb-6 p-6 bg-white rounded-xl shadow-xl border-b-4 border-blue-700">
-            <h1 class="text-4xl font-extrabold text-blue-800">InventoryPro</h1>
+            <div>
+                <h1 class="text-4xl font-extrabold text-blue-800">Hubli - StoreInsights</h1>
+                <p class="text-gray-600">Your friendly neighborhood store, digitized.</p>
+            </div>
             <div class="mt-4 md:mt-0 text-left md:text-right">
                 <div class="text-sm text-gray-600 break-all">
                     <span id="user-id-display"></span>
@@ -935,41 +1335,62 @@
             </div>
         </header>
 
+        <!-- User Navigation -->
+        <nav id="user-nav" class="flex justify-around bg-white rounded-xl shadow-lg p-2 mb-6">
+            <button data-page="user-inventory-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg icon-shop">
+                Shop
+            </button>
+            <button data-page="user-cart-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg icon-cart">
+                Cart
+            </button>
+            <button data-page="user-orders-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg icon-orders">
+                My Orders
+            </button>
+            <button data-page="user-profile-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg icon-profile">
+                My Profile
+            </button>
+        </nav>
+        
+        <!-- Manager Navigation -->
+        <nav id="manager-nav" class="hidden flex flex-wrap justify-center bg-gray-800 rounded-xl shadow-lg p-2 mb-6 gap-2">
+            <button data-tab="dashboard-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-blue-700 hover:bg-blue-600 rounded-lg icon-dashboard">
+                Dashboard
+            </button>
+            <button data-tab="inventory-mgt-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-inventory">
+                Inventory
+            </button>
+            <button data-tab="manager-orders-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-orders">
+                All Orders
+            </button>
+            <button data-tab="user-mgt-tab" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-users">
+                User Mgt
+            </button>
+            <button data-tab="user-profile-page" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg icon-profile">
+                My Profile
+            </button>
+        </nav>
+
         <!-- ================================== -->
-        <!--      REGULAR USER INTERFACE      -->
+        <!--        COMMON PAGES (USER)         -->
         <!-- ================================== -->
         <main id="user-interface" class="hidden bg-gray-50 p-4 md:p-6 rounded-xl shadow-inner">
-            <!-- User Navigation -->
-            <nav id="user-nav" class="flex justify-around bg-white rounded-xl shadow-lg p-2 mb-6">
-                <button data-page="user-inventory-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg transition-all duration-200">
-                    Shop
-                </button>
-                <button data-page="user-cart-page" class="flex-1 py-3 px-2 text-center font-semibold text-gray-700 hover:bg-gray-100 rounded-lg transition-all duration-200">
-                    Cart
-                </button>
-            </nav>
-
             <!-- User Page: Inventory -->
             <div id="user-inventory-page">
                 <h2 class="text-2xl font-semibold mb-4">Products</h2>
-                <div id="user-inventory-list" class="space-y-4">
-                    <!-- JS will render inventory items here -->
-                </div>
+                <div id="user-inventory-list" class="space-y-4"></div>
             </div>
 
             <!-- User Page: Cart -->
             <div id="user-cart-page" class="hidden">
                 <h2 class="text-2xl font-semibold mb-4">Your Cart</h2>
                 <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
-                    <div id="cart-items-list" class="space-y-4 mb-5">
-                        <!-- JS will render cart items here -->
-                    </div>
+                    <div id="cart-items-list" class="space-y-4 mb-5"></div>
                     <hr class="my-4">
                     <div class="flex justify-between items-center mb-5">
                         <span class="text-lg font-medium text-gray-800">Total:</span>
                         <span id="cart-total" class="text-lg font-bold text-gray-900">0 items</span>
                     </div>
-                    <button id="go-to-checkout-btn" class="w-full bg-green-500 text-white font-semibold py-3 px-4 rounded-lg hover:bg-green-600 transition-all duration-200 shadow-md hover:shadow-lg transform hover:-translate-y-0.5">
+                    <button id="go-to-checkout-btn" class="w-full bg-green-500 text-white font-semibold py-3 px-4 rounded-lg hover:bg-green-600 shadow-md">
                         Proceed to Checkout
                     </button>
                 </div>
@@ -979,35 +1400,55 @@
             <div id="user-checkout-page" class="hidden">
                 <h2 class="text-2xl font-semibold mb-4">Checkout</h2>
                 <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
-                    <h3 class="text-xl font-semibold mb-4">Order Summary & Remarks</h3>
-                    <p class="text-sm text-gray-600 mb-5">Please add any required remarks for each item before confirming.</p>
-                    <div id="checkout-items-list" class="space-y-4 mb-6">
-                        <!-- JS will render cart items with remark inputs here -->
+                    <h3 class="text-xl font-semibold mb-4">1. Order Details</h3>
+                    <div id="checkout-items-list" class="space-y-6 mb-6">
+                        <!-- JS will render cart items with forms here -->
                     </div>
-                    <button id="confirm-order-btn" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 transition-all duration-200 shadow-md hover:shadow-lg transform hover:-translate-y-0.5">
+                    
+                    <h3 class="text-xl font-semibold mb-4">2. Supervision</h3>
+                    <div>
+                        <label for="supervisor-name" class="block text-sm font-medium text-gray-700">Withdrawal Under Supervision Of:</label>
+                        <input type="text" id="supervisor-name" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm" placeholder="Enter full name of security/supervisor">
+                    </div>
+                    
+                    <hr class="my-6">
+                    
+                    <button id="confirm-order-btn" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 shadow-md">
                         Confirm Order
                     </button>
                 </div>
             </div>
+            
+            <!-- User Page: Order History -->
+            <div id="user-orders-page" class="hidden">
+                <h2 class="text-2xl font-semibold mb-4">My Order History</h2>
+                <div id="user-orders-list" class="space-y-4">
+                    <!-- JS renders user's orders -->
+                </div>
+            </div>
+            
+            <!-- User Page: Order Summary -->
+            <div id="order-summary-page" class="hidden">
+                <h2 class="text-2xl font-semibold mb-4 text-green-600">Order Placed Successfully!</h2>
+                <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="text-xl font-semibold">Order Summary</h3>
+                        <button id="copy-summary-btn" class="bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-600">
+                            Copy Summary
+                        </button>
+                    </div>
+                    <div id="order-summary-details">
+                        <!-- JS renders order details -->
+                    </div>
+                </div>
+            </div>
+            
         </main>
 
         <!-- ================================== -->
-        <!--        MANAGER INTERFACE         -->
+        <!--        COMMON PAGES (MANAGER)      -->
         <!-- ================================== -->
         <main id="manager-interface" class="hidden bg-gray-50 p-4 md:p-6 rounded-xl shadow-inner">
-            <!-- Manager Navigation -->
-            <nav id="manager-nav" class="flex flex-wrap justify-center bg-gray-800 rounded-xl shadow-lg p-2 mb-6 gap-2">
-                <button onclick="showManagerTab('dashboard')" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-blue-700 hover:bg-blue-600 rounded-lg transition-all duration-200">
-                    Dashboard
-                </button>
-                <button onclick="showManagerTab('inventory-mgt')" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg transition-all duration-200">
-                    Inventory Mgt
-                </button>
-                <button onclick="showManagerTab('user-mgt')" class="flex-1 min-w-[120px] text-center py-3 px-4 font-semibold text-white bg-gray-700 hover:bg-blue-600 rounded-lg transition-all duration-200">
-                    User Mgt
-                </in>
-            </nav>
-
             <!-- Manager Tab: Dashboard -->
             <div id="dashboard-tab">
                 <h2 class="text-2xl font-semibold mb-4">Manager Dashboard</h2>
@@ -1016,9 +1457,7 @@
                     <p class="text-gray-700">Total unique items: <span id="dashboard-summary-total" class="font-bold text-blue-600 text-lg">0</span></p>
                     
                     <h3 class="text-xl font-semibold mt-6 mb-4 text-red-600">Low Stock Alert</h3>
-                    <ul id="low-stock-list" class="space-y-3">
-                        <!-- JS will render low stock items here -->
-                    </ul>
+                    <ul id="low-stock-list" class="space-y-3"></ul>
                 </div>
             </div>
 
@@ -1029,12 +1468,12 @@
                 <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl mb-6">
                     <h3 class="text-xl font-semibold mb-4 text-gray-800">Add New Item</h3>
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        <input type="text" id="item-name" placeholder="Item Name" class="col-span-1 md:col-span-2 p-3 border rounded-lg border-gray-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
-                        <input type="number" id="item-stock" placeholder="Initial Stock" value="10" class="p-3 border rounded-lg border-gray-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
+                        <input type="text" id="item-name" placeholder="Item Name" class="col-span-1 md:col-span-2 p-3 border rounded-lg">
+                        <input type="number" id="item-stock" placeholder="Initial Stock" value="10" class="p-3 border rounded-lg">
                     </div>
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
-                        <input type="number" id="item-low-stock" placeholder="Low Stock Threshold" value="5" class="p-3 border rounded-lg border-gray-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-300 transition-all duration-200">
-                        <button onclick="handleAddInventoryItem()" class="col-span-1 md:col-span-2 bg-green-500 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-600 transition-all duration-200 shadow-md hover:shadow-lg transform hover:-translate-y-0.5">
+                        <input type="number" id="item-low-stock" placeholder="Low Stock Threshold" value="5" class="p-3 border rounded-lg">
+                        <button onclick="handleAddInventoryItem()" class="col-span-1 md:col-span-2 bg-green-500 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-600 shadow-md">
                             Add Item
                         </button>
                     </div>
@@ -1043,9 +1482,15 @@
                 <!-- Manage Existing Items -->
                 <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
                     <h3 class="text-xl font-semibold mb-4 text-gray-800">Manage Stock</h3>
-                    <div id="manager-inventory-list" class="space-y-4">
-                        <!-- JS will render full inventory list for managers here -->
-                    </div>
+                    <div id="manager-inventory-list" class="space-y-4"></div>
+                </div>
+            </div>
+            
+            <!-- Manager Tab: Order History -->
+            <div id="manager-orders-tab" class="hidden">
+                <h2 class="text-2xl font-semibold mb-4">All Order History</h2>
+                <div id="manager-orders-list" class="space-y-4">
+                    <!-- JS renders all orders -->
                 </div>
             </div>
             
@@ -1053,13 +1498,23 @@
             <div id="user-mgt-tab" class="hidden">
                 <h2 class="text-2xl font-semibold mb-4">User Role Management</h2>
                 <div class="bg-white p-4 md:p-6 rounded-xl shadow-xl">
-                    <div id="user-roles-list" class="space-y-4">
-                        <!-- JS will render user roles here -->
-                    </div>
+                    <div id="user-roles-list" class="space-y-4"></div>
                 </div>
             </div>
+            
         </main>
+        
+        <!-- Common Page: Profile (Used by both User & Manager) -->
+        <div id="user-profile-page" class="hidden bg-gray-50 p-4 md:p-6 rounded-xl shadow-inner">
+            <!-- JS will render the profile form here -->
+        </div>
+        
     </div>
+    
+    <!-- Footer -->
+    <footer class="text-center py-4 mt-8">
+        <p class="text-sm text-gray-600">Designed by Rh. for ⚡ Team Sonic - Hubli</p>
+    </footer>
     
     <!-- Toast Notification -->
     <div id="toast-message" class="hidden opacity-0 fixed top-5 right-5 z-50 bg-green-600 text-white py-3 px-6 rounded-lg shadow-xl transition-all duration-500">
