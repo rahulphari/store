@@ -82,21 +82,41 @@
         .filter-pill:not(.active) {
             @apply bg-gray-200 text-gray-700 hover:bg-gray-300;
         }
+        /* Stock status badges */
+        .status-badge {
+            @apply text-xs font-medium px-2.5 py-0.5 rounded-full;
+        }
+        .status-in-stock {
+            @apply bg-green-100 text-green-800;
+        }
+        .status-low-stock {
+            @apply bg-yellow-100 text-yellow-800;
+        }
+        .status-out-of-stock {
+            @apply bg-red-100 text-red-800;
+        }
     </style>
 </head>
 <body class="h-full flex flex-col">
 
     <!-- Header -->
     <header class="bg-white shadow-md p-4 w-full z-10">
-        <div class="container mx-auto max-w-6xl">
-            <h1 class="text-3xl font-bold text-red-700">STORE-SIGHT</h1>
-            <p class="text-sm text-gray-600">Hubli_Budarshingi_H Inventory-Stock Management</p>
-            <p id="store-in-charge-header" class="text-sm text-gray-800 font-bold mt-1 text-lg">Store In-Charge: Ankita Chandrappa Bandi</p>
+        <div class="container mx-auto max-w-6xl flex justify-between items-center">
+            <div>
+                <h1 class="text-3xl font-bold text-red-700">STORE-SIGHT</h1>
+                <p class="text-sm text-gray-600">Hubli_Budarshingi_H Inventory-Stock Management</p>
+                <p id="store-in-charge-header" class="text-sm text-gray-800 font-bold mt-1 text-lg">Store In-Charge: Ankita Chandrappa Bandi</p>
+            </div>
+            
+            <!-- Public Login Button -->
+            <div id="public-login-container">
+                <button id="public-login-button" class="btn btn-primary w-auto">Employee Login</button>
+            </div>
             
             <!-- Logged-in User Info -->
-            <div id="user-info-header" class="hidden mt-2 text-sm">
-                <span id="user-details-header"></span>
-                <span id="user-role-header" class="font-bold ml-2"></span>
+            <div id="user-info-header" class="hidden mt-2 text-sm text-right">
+                <span id="user-details-header" class="block"></span>
+                <span id="user-role-header" class="font-bold ml-2 block"></span>
                 <a href="#" id="logout-button" class="ml-4 text-red-600 hover:underline font-medium">Logout</a>
             </div>
         </div>
@@ -115,7 +135,7 @@
             <div id="auth-page" class="hidden">
                 <div class="max-w-md mx-auto mt-10">
                     <div id="login-form-container" class="card">
-                        <h2 class="page-header">Login</h2>
+                        <h2 class="page-header">Employee Login</h2>
                         <form id="login-form">
                             <div>
                                 <label for="login-emp-id" class="form-label">Employee ID</label>
@@ -134,7 +154,7 @@
                     </div>
 
                     <div id="register-form-container" class="card hidden">
-                        <h2 class="page-header">Register</h2>
+                        <h2 class="page-header">Register New Employee</h2>
                         <form id="register-form">
                             <div>
                                 <label for="reg-emp-id" class="form-label">Employee ID</label>
@@ -205,30 +225,16 @@
                             <span id="filter-out-of-stock" class="filter-pill">Out of Stock</span>
                         </div>
                     </div>
-                    <p class="text-sm text-gray-500 mb-4">Last updated: <span id="public-last-updated"></span></p>
+                    <p class="text-sm text-gray-500 mb-4">Inventory up-to-date.</p>
 
-                    <!-- Scrollable Table Container -->
-                    <div class="overflow-y-auto max-h-[60vh] border border-gray-200 rounded-lg">
-                        <table class="min-w-full divide-y divide-gray-200">
-                            <thead class="bg-gray-50 sticky top-0 z-10">
-                                <tr>
-                                    <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Item</th>
-                                    <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Code</th>
-                                    <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Category</th>
-                                    <th scope="col" class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Stock</th>
-                                    <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Update</th>
-                                </tr>
-                            </thead>
-                            <tbody id="public-inventory-table-body" class="bg-white divide-y divide-gray-200">
-                                <!-- JS will populate this -->
-                            </tbody>
-                        </table>
+                    <!-- Inventory List Container -->
+                    <div id="public-inventory-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        <!-- JS will populate this with cards -->
                     </div>
+
                     <div id="public-inventory-empty" class="text-center p-10 text-gray-500 hidden">
                         <p>No inventory items found.</p>
                     </div>
-                    
-                    <button id="public-login-button" class="btn btn-primary mt-6">Login / Register to Place Request</button>
                 </div>
             </div>
 
@@ -417,9 +423,6 @@
                             <button id="bulk-import-submit" class="btn btn-primary mt-2 w-auto">Import Items</button>
                             <p id="bulk-import-status" class="text-sm mt-2"></p>
                         </section>
-
-                        <!-- REMOVED: Section 2: Bulk Stock Update -->
-                        
                     </div>
 
                     <!-- Manager My Profile Page -->
@@ -951,11 +954,14 @@
         function updateHeaderUI(isLoggedIn) {
             if (isLoggedIn && currentUserProfile) {
                 $('user-info-header').classList.remove('hidden');
+                $('public-login-container').classList.add('hidden');
+                
                 $('user-details-header').textContent = `User: ${currentUserProfile.name} (Emp ID: ${currentUserProfile.empId})`;
                 $('user-role-header').textContent = `Role: ${currentUserRole}`;
-                $('user-role-header').className = currentUserRole === 'superuser' ? 'font-bold ml-2 text-yellow-500' : 'font-bold ml-2 text-red-600';
+                $('user-role-header').className = currentUserRole === 'superuser' ? 'font-bold ml-2 block text-yellow-500' : 'font-bold ml-2 block text-red-600';
             } else {
                 $('user-info-header').classList.add('hidden');
+                $('public-login-container').classList.remove('hidden');
             }
         }
         
@@ -1171,14 +1177,14 @@
         // --- Public Page ---
         
         function renderPublicInventory(filter = 'all') {
-            const tableBody = $('public-inventory-table-body');
+            const list = $('public-inventory-list');
             const emptyMsg = $('public-inventory-empty');
-            const lastUpdated = $('public-last-updated');
+            
+            updateHeaderUI(false); // Ensure login button is shown
 
             if (globalInventory.length === 0) {
-                tableBody.innerHTML = '';
+                list.innerHTML = '';
                 emptyMsg.classList.remove('hidden');
-                lastUpdated.textContent = 'N/A';
                 return;
             }
             
@@ -1194,47 +1200,35 @@
                 filteredInventory = globalInventory.filter(item => item.stock === 0);
             }
             
-            // Find the most recent update
-            const mostRecentUpdate = globalInventory.reduce((latest, item) => {
-                return (item.lastUpdate && item.lastUpdate.timestamp > (latest?.timestamp || 0)) ? item.lastUpdate : latest;
-            }, null);
-            lastUpdated.textContent = mostRecentUpdate ? formatTimestamp(mostRecentUpdate.timestamp) : 'N/A';
-            
-            tableBody.innerHTML = filteredInventory.map(item => {
-                let stockClass = 'text-gray-900';
-                let stockStatus = '';
+            list.innerHTML = filteredInventory.map(item => {
+                let stockClass = 'status-in-stock';
+                let stockText = 'In Stock';
                 if (item.stock === 0) {
-                    stockClass = 'text-red-600 font-bold';
-                    stockStatus = '(Out of Stock)';
+                    stockClass = 'status-out-of-stock';
+                    stockText = 'Out of Stock';
                 } else if (item.stock <= item.lowStockThreshold) {
-                    stockClass = 'text-yellow-600 font-bold';
-                    stockStatus = '(Low Stock)';
+                    stockClass = 'status-low-stock';
+                    stockText = 'Low Stock';
                 }
 
-                let lastUpdateHtml = 'N/A';
+                let lastUpdateHtml = 'No recent activity.';
                 if (item.lastUpdate) {
                     const verb = item.lastUpdate.type === 'add' ? 'Added' : 'Retrieved';
-                    lastUpdateHtml = `${verb} ${item.lastUpdate.quantity} by ${item.lastUpdate.userName}<br><span class="text-xs text-gray-500">${formatTimestamp(item.lastUpdate.timestamp)}</span>`;
+                    lastUpdateHtml = `${verb} ${item.lastUpdate.quantity} by ${item.lastUpdate.userName} on ${formatTimestamp(item.lastUpdate.timestamp)}`;
                 }
 
                 return `
-                    <tr class="public-inventory-item" data-id="${item.id}">
-                        <td class="px-4 py-3 whitespace-nowrap">
-                            <div class="text-sm font-medium text-gray-900">${item.name}</div>
-                        </td>
-                        <td class="px-4 py-3 whitespace-nowrap">
-                            <div class="text-sm text-gray-700">${item.itemCode || 'N/A'}</div>
-                        </td>
-                        <td class="px-4 py-3 whitespace-nowrap">
-                            <div class="text-sm text-gray-700">${item.category || 'N/A'}</div>
-                        </td>
-                        <td class="px-4 py-3 whitespace-nowrap text-center">
-                            <div class="text-sm ${stockClass}">${item.stock} <span class="text-xs">${stockStatus}</span></div>
-                        </td>
-                        <td class="px-4 py-3 whitespace-nowrap">
-                            <div class="text-sm text-gray-700">${lastUpdateHtml}</div>
-                        </td>
-                    </tr>
+                    <div class="public-inventory-item bg-white rounded-lg shadow-sm border border-gray-200 p-4">
+                        <div class="flex justify-between items-start">
+                            <h3 class="font-bold text-gray-900">${item.name}</h3>
+                            <span class="status-badge ${stockClass}">${stockText}</span>
+                        </div>
+                        <p class="text-sm text-gray-500">${item.category || 'N/A'} (${item.itemCode || 'N/A'})</p>
+                        <div class="mt-2 pt-2 border-t">
+                            <p class="text-sm font-medium text-gray-800">${item.stock} <span class="text-gray-600">in stock</span></p>
+                            <p class="text-xs text-gray-500 mt-1">${lastUpdateHtml}</p>
+                        </div>
+                    </div>
                 `;
             }).join('');
         }
