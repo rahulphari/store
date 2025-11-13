@@ -16,7 +16,7 @@
             signOut,
             createUserWithEmailAndPassword,
             signInWithEmailAndPassword
-        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js"; // Typo fixed
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { 
             getFirestore, 
             doc, 
@@ -60,6 +60,7 @@
         let unsubscribeDashboardLogs = () => {};
 
         // --- USER'S FIREBASE CONFIG ---
+        // This config is public. For a real app, you'd secure this.
         const firebaseConfig = {
           apiKey: "AIzaSyDmCSYXnlcXfxt-MvoEkGs0ilVW-E2_Ex4",
           authDomain: "hubli-store.firebaseapp.com",
@@ -694,6 +695,12 @@
                         }
                         
                         const inventoryData = inventoryDoc.data();
+                        
+                        // --- NEW: Check if hidden ---
+                        if (inventoryData.isHidden) {
+                            throw new Error(`Item "${inventoryData.name}" is currently unavailable.`);
+                        }
+                        
                         if (inventoryData.stock < item.quantity) {
                             throw new Error(`Not enough stock for "${inventoryData.name}". Only ${inventoryData.stock} left.`);
                         }
@@ -841,7 +848,7 @@
 
         // --- REGULAR USER: RENDER ---
         
-        // --- NEW PUBLIC INVENTORY RENDER ---
+        // --- NEW PUBLIC INVENTORY RENDER (WITH CATEGORIES & HIDING) ---
         function renderPublicInventory(inventory) {
             const list = document.getElementById('public-inventory-list');
             const errorEl = document.getElementById('public-inventory-error');
@@ -850,46 +857,74 @@
             list.innerHTML = ''; // Clear previous
             errorEl.classList.add('hidden');
             
-            if (inventory.length === 0) {
+            // --- NEW: Filter out hidden items ---
+            const visibleInventory = inventory.filter(item => !item.isHidden);
+            
+            if (visibleInventory.length === 0) {
                 list.innerHTML = '<p class="text-gray-500">No items in inventory.</p>';
                 return;
             }
             
-            inventory.forEach(item => {
-                const inStock = item.stock > 0;
-                
-                // --- New Logic for Last Update ---
-                const addDate = item.lastAddition?.date?.toDate();
-                const withdrawDate = item.lastWithdrawal?.date?.toDate();
-                let lastUpdateHtml = '<p class="text-sm text-gray-500">No recent activity.</p>';
-                
-                if (addDate && (!withdrawDate || addDate > withdrawDate)) {
-                    lastUpdateHtml = `<p class="text-sm text-gray-700">Last Update: <span class="font-medium text-green-700">Added ${item.lastAddition.qty}</span> by ${item.lastAddition.user} on ${addDate.toLocaleString()}</p>`;
-                } else if (withdrawDate) {
-                    lastUpdateHtml = `<p class="text-sm text-gray-700">Last Update: <span class="font-medium text-red-700">Retrieved ${item.lastWithdrawal.qty}</span> by ${item.lastWithdrawal.user} on ${withdrawDate.toLocaleString()}</p>`;
+            // --- NEW: Group by category ---
+            const categories = visibleInventory.reduce((acc, item) => {
+                const category = item.category || 'Uncategorized';
+                if (!acc[category]) {
+                    acc[category] = [];
                 }
-                // --- End of New Logic ---
+                acc[category].push(item);
+                return acc;
+            }, {});
 
-                list.innerHTML += `
-                    <div class="bg-white p-4 rounded-lg border">
-                        <div class="flex flex-col md:flex-row justify-between md:items-start">
-                            <!-- Left Side: Item Name and Last Update -->
-                            <div class="flex-1">
-                                <h3 class="text-xl font-semibold text-gray-800">${item.name} <span class="text-sm font-normal text-gray-500">(${item.itemCode || 'N/A'})</span></h3>
-                                <p class="text-sm font-medium text-gray-600">${item.category || 'Uncategorized'}</p>
-                                ${lastUpdateHtml} 
-                            </div>
-                            <!-- Right Side: Stock and Status -->
-                            <div class="mt-2 md:mt-0 md:ml-4 text-left md:text-right">
-                                <p class="text-2xl font-bold text-gray-900">${item.stock} <span class="text-sm font-normal text-gray-600">in stock</span></p>
-                                <p class="mt-1">
-                                    ${inStock ? `<span class="font-medium text-green-700">In Stock</span>` : '<span class="font-medium text-red-600">Out of Stock</span>'}
-                                </p>
+            // 2. Get sorted category names
+            const sortedCategories = Object.keys(categories).sort();
+            let html = '';
+
+            // 3. Render by category
+            for (const categoryName of sortedCategories) {
+                const items = categories[categoryName];
+                
+                // Add category header
+                html += `<h3 class="text-2xl font-bold text-gray-700 mt-6 mb-3 border-b-2 border-gray-200 pb-2">${categoryName}</h3>`;
+                
+                // Add items for this category
+                items.forEach(item => {
+                    const inStock = item.stock > 0;
+                    
+                    // --- Logic for Last Update ---
+                    const addDate = item.lastAddition?.date?.toDate();
+                    const withdrawDate = item.lastWithdrawal?.date?.toDate();
+                    let lastUpdateHtml = '<p class="text-sm text-gray-500">No recent activity.</p>';
+                    
+                    if (addDate && (!withdrawDate || addDate > withdrawDate)) {
+                        lastUpdateHtml = `<p class="text-sm text-gray-700">Last Update: <span class="font-medium text-green-700">Added ${item.lastAddition.qty}</span> by ${item.lastAddition.user} on ${addDate.toLocaleString()}</p>`;
+                    } else if (withdrawDate) {
+                        lastUpdateHtml = `<p class="text-sm text-gray-700">Last Update: <span class="font-medium text-red-700">Retrieved ${item.lastWithdrawal.qty}</span> by ${item.lastWithdrawal.user} on ${withdrawDate.toLocaleString()}</p>`;
+                    }
+                    // --- End of Logic ---
+
+                    html += `
+                        <div class="bg-white p-4 rounded-lg border">
+                            <div class="flex flex-col md:flex-row justify-between md:items-start">
+                                <!-- Left Side: Item Name and Last Update -->
+                                <div class="flex-1">
+                                    <h3 class="text-xl font-semibold text-gray-800">${item.name} <span class="text-sm font-normal text-gray-500">(${item.itemCode || 'N/A'})</span></h3>
+                                    <p class="text-sm font-medium text-gray-600">${item.category || 'Uncategorized'}</p>
+                                    ${lastUpdateHtml} 
+                                </div>
+                                <!-- Right Side: Stock and Status -->
+                                <div class="mt-2 md:mt-0 md:ml-4 text-left md:text-right">
+                                    <p class="text-2xl font-bold text-gray-900">${item.stock} <span class="text-sm font-normal text-gray-600">in stock</span></p>
+                                    <p class="mt-1">
+                                        ${inStock ? `<span class="font-medium text-green-700">In Stock</span>` : '<span class="font-medium text-red-600">Out of Stock</span>'}
+                                    </p>
+                                </div>
                             </div>
                         </div>
-                    </div>
-                `;
-            });
+                    `;
+                });
+            } // End category loop
+            
+            list.innerHTML = html;
         }
         
         function renderProfilePage(isFirstTime = false) {
@@ -940,16 +975,49 @@
             document.getElementById('update-profile-btn').onclick = () => handleProfileUpdate(isFirstTime);
         }
         
+        // --- NEW: RENDER USER INVENTORY WITH FILTERS ---
         function renderUserInventory(inventory) {
             const list = document.getElementById('user-inventory-list');
             if (!list) return;
+
+            // --- START NEW FILTER LOGIC ---
+            const categoryFilterEl = document.getElementById('user-category-filter');
+            const searchFilterEl = document.getElementById('user-search-filter');
+            
+            const selectedCategory = categoryFilterEl ? categoryFilterEl.value : 'ALL';
+            const searchTerm = searchFilterEl ? searchFilterEl.value.toLowerCase() : '';
+
+            // Populate Category Filter (only from visible items)
+            const allVisibleItems = inventory.filter(item => !item.isHidden);
+            const categories = ['ALL', ...new Set(allVisibleItems.map(item => item.category || 'Uncategorized'))];
+            
+            if (categoryFilterEl) {
+                const currentVal = categoryFilterEl.value; // Save current value
+                // Check if options are different before re-rendering to avoid flicker/losing focus
+                if (categoryFilterEl.options.length !== categories.length) {
+                     categoryFilterEl.innerHTML = categories.sort().map(cat => 
+                        `<option value="${cat}" ${cat === currentVal ? 'selected' : ''}>${cat}</option>`
+                     ).join('');
+                }
+                // Ensure the value is set correctly even if options didn't change
+                categoryFilterEl.value = selectedCategory;
+            }
+
+            // Now, filter the visible items
+            const filteredAndVisibleInventory = allVisibleItems.filter(item => {
+                const categoryMatch = (selectedCategory === 'ALL') || (item.category || 'Uncategorized') === selectedCategory;
+                const searchMatch = item.name.toLowerCase().includes(searchTerm) || (item.itemCode || '').toLowerCase().includes(searchTerm);
+                return categoryMatch && searchMatch;
+            });
+            // --- END NEW FILTER LOGIC ---
+            
             list.innerHTML = '';
-            if (inventory.length === 0) {
-                list.innerHTML = '<p class="text-gray-500">No items in inventory.</p>';
+            if (filteredAndVisibleInventory.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">No items match your filters.</p>';
                 return;
             }
 
-            inventory.forEach(item => {
+            filteredAndVisibleInventory.forEach(item => {
                 const inStock = item.stock > 0;
                 list.innerHTML += `
                     <div class="bg-white p-4 rounded-lg border flex justify-between items-center">
@@ -1184,7 +1252,7 @@
             
             // 1. Render KPIs from cache
             const pendingUsers = userRolesCache.filter(user => user.status === 'pending').length;
-            const lowStockItems = inventoryCache.filter(item => item.stock <= item.lowStockThreshold).length;
+            const lowStockItems = inventoryCache.filter(item => item.stock <= item.lowStockThreshold && !item.isHidden).length; // Don't count hidden low stock
             const totalItems = inventoryCache.length;
             
             kpiPending.textContent = pendingUsers;
@@ -1217,7 +1285,7 @@
             
             // 3. Render Low Stock List
             const lowStockList = document.getElementById('dashboard-low-stock-list');
-            const lowStockItemsToShow = inventoryCache.filter(item => item.stock <= item.lowStockThreshold).slice(0, 5);
+            const lowStockItemsToShow = inventoryCache.filter(item => item.stock <= item.lowStockThreshold && !item.isHidden).slice(0, 5); // Don't show hidden
             lowStockList.innerHTML = '';
             if (lowStockItemsToShow.length === 0) {
                 lowStockList.innerHTML = '<p class="text-sm text-gray-500">All stock levels look good!</p>';
@@ -1258,62 +1326,129 @@
             });
         }
 
+        // --- NEW: RENDER MANAGER INVENTORY WITH FILTERS ---
         function renderManagerInventory(inventory) {
             const list = document.getElementById('manager-inventory-list');
             if (!list) return;
+
+            // --- START NEW FILTER LOGIC ---
+            const categoryFilterEl = document.getElementById('manager-category-filter');
+            const searchFilterEl = document.getElementById('manager-search-filter');
+            
+            const selectedCategory = categoryFilterEl ? categoryFilterEl.value : 'ALL';
+            const searchTerm = searchFilterEl ? searchFilterEl.value.toLowerCase() : '';
+
+            // Populate Category Filter (from ALL items, hidden or not)
+            const categories = ['ALL', ...new Set(inventory.map(item => item.category || 'Uncategorized'))];
+            
+            if (categoryFilterEl) {
+                const currentVal = categoryFilterEl.value;
+                if (categoryFilterEl.options.length !== categories.length) {
+                     categoryFilterEl.innerHTML = categories.sort().map(cat => 
+                        `<option value="${cat}" ${cat === currentVal ? 'selected' : ''}>${cat}</option>`
+                     ).join('');
+                } else {
+                     categoryFilterEl.value = selectedCategory;
+                }
+            }
+
+            // Filter the inventory
+            const filteredInventory = inventory.filter(item => {
+                const categoryMatch = (selectedCategory === 'ALL') || (item.category || 'Uncategorized') === selectedCategory;
+                const searchMatch = item.name.toLowerCase().includes(searchTerm) || (item.itemCode || '').toLowerCase().includes(searchTerm);
+                return categoryMatch && searchMatch;
+            });
+            // --- END NEW FILTER LOGIC ---
+
             list.innerHTML = '';
             
-            if (inventory.length === 0) {
-                list.innerHTML = '<p class="text-gray-500">No items in inventory yet.</p>';
+            if (filteredInventory.length === 0) {
+                list.innerHTML = '<p class="text-gray-500">No items match your filters.</p>';
                 return;
             }
 
-            inventory.forEach(item => {
-                let superuserButtons = '';
-                if (currentUserRole === 'superuser') {
-                    superuserButtons = `
-                        <button onclick="handleDeleteItem('${item.id}', '${item.name}')" class="w-full bg-red-600 text-white py-2 px-4 rounded-lg hover:bg-red-700 font-semibold">
-                            DELETE ITEM
-                        </button>
-                    `;
+            // 1. Group by category
+            const categoryGroups = filteredInventory.reduce((acc, item) => {
+                const category = item.category || 'Uncategorized';
+                if (!acc[category]) {
+                    acc[category] = [];
                 }
+                acc[category].push(item);
+                return acc;
+            }, {});
+
+            // 2. Get sorted category names
+            const sortedCategories = Object.keys(categoryGroups).sort();
+            let html = '';
+
+            // 3. Render by category
+            for (const categoryName of sortedCategories) {
+                const items = categoryGroups[categoryName];
                 
-                // --- SIMPLIFIED LISTING ---
-                list.innerHTML += `
-                    <div class="bg-white p-4 rounded-lg border space-y-4">
-                        <div class="flex flex-col md:flex-row justify-between md:items-start">
-                            <div>
-                                <h3 class="text-xl font-semibold text-gray-800">${item.name}</h3>
-                                <p class="text-sm text-gray-600">${item.category || 'Uncategorized'} | <span class="font-mono">${item.itemCode || 'N/A'}</span></p>
-                            </div>
-                            <span class="font-bold text-2xl text-red-600 mt-2 md:mt-0">Stock: ${item.stock}</span>
+                // Check if *all* items in this category are hidden (for the button text)
+                const allHidden = items.every(item => item.isHidden);
+                
+                html += `
+                    <div class="mb-8">
+                        <div class="flex justify-between items-center bg-gray-200 p-3 rounded-lg mb-4">
+                            <h3 class="text-2xl font-bold text-gray-700">${categoryName}</h3>
+                            <button onclick="handleToggleCategory('${categoryName}', ${!allHidden})" class="text-sm font-semibold ${allHidden ? 'bg-green-500' : 'bg-yellow-500'} text-white py-2 px-3 rounded-lg hover:opacity-80">
+                                ${allHidden ? 'Show Category' : 'Hide Category'}
+                            </button>
                         </div>
                         
-                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                             <div>
-                                <label for="lowstock-${item.id}" class="text-xs font-medium text-gray-600">Low Stock At</label>
-                                <input type="number" id="lowstock-${item.id}" value="${item.lowStockThreshold}" class="mt-1 w-full p-2 border border-gray-300 rounded-lg">
-                            </div>
-                            <button onclick="handleUpdateItemThreshold('${item.id}')" class="md:mt-6 bg-gray-600 text-white py-2 px-4 rounded-lg hover:bg-gray-700 font-semibold">
-                                Save Threshold
-                            </button>
-                             <button onclick="handleOpenAddStockModal('${item.id}', '${item.name}', ${item.stock})" class="md:mt-6 bg-red-500 text-white py-2 px-4 rounded-lg hover:bg-red-600 font-semibold">
-                                Add Stock
-                            </button>
-                        </div>
-                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                            <button onclick="handleEditItemName('${item.id}', '${item.name}')" class="bg-yellow-500 text-white py-2 px-4 rounded-lg hover:bg-yellow-600 font-semibold">
-                                Edit Name/Details
-                            </button>
-                            <!-- NEW HISTORY BUTTON -->
-                            <button onclick="handleViewItemHistory('${item.id}', '${item.name}')" class="bg-gray-200 text-gray-800 py-2 px-4 rounded-lg hover:bg-gray-300 font-semibold">
-                                View History
-                            </button>
-                            ${superuserButtons}
-                        </div>
-                    </div>
+                        <div class="space-y-4">
                 `;
-            });
+                
+                // 4. Render the new simplified card for each item
+                items.forEach(item => {
+                    const isHidden = item.isHidden || false;
+                    let superuserDeleteBtn = '';
+                    if (currentUserRole === 'superuser') {
+                        superuserDeleteBtn = `
+                            <button onclick="handleDeleteItem('${item.id}', '${item.name}')" class="text-red-500 hover:text-red-700 font-semibold text-sm">
+                                Delete Item
+                            </button>
+                        `;
+                    }
+                    
+                    html += `
+                        <div class="bg-white p-4 rounded-lg border ${isHidden ? 'opacity-60 bg-gray-50' : ''}">
+                            <!-- Top row: Name and Edit Button -->
+                            <div class="flex justify-between items-start mb-3">
+                                <div>
+                                    <h3 class="text-xl font-semibold text-gray-800">${item.name} ${isHidden ? '<span class="text-sm text-red-600">(Hidden)</span>' : ''}</h3>
+                                    <p class="text-sm text-gray-600">${item.category} | <span class="font-mono">${item.itemCode || 'N/A'}</span></p>
+                                    <p class="text-xs text-gray-500">Threshold: ${item.lowStockThreshold}</p>
+                                </div>
+                                <button onclick="handleOpenEditModal('${item.id}')" class="text-gray-500 hover:text-red-600 p-1 rounded-full">
+                                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                                </button>
+                            </div>
+                            
+                            <p class="font-bold text-2xl ${item.stock <= item.lowStockThreshold ? 'text-red-600' : 'text-gray-800'} mb-4">Stock: ${item.stock}</p>
+                            
+                            <!-- Bottom row: Add Stock and History -->
+                            <div class="flex flex-wrap items-center gap-3">
+                                <input type="number" id="add-stock-qty-${item.id}" class="p-2 border border-gray-300 rounded-lg w-24" placeholder="Qty">
+                                <button onclick="handleQuickAddStock('${item.id}', ${item.stock})" class="bg-red-500 text-white py-2 px-4 rounded-lg hover:bg-red-600 font-semibold">
+                                    Add Stock
+                                </button>
+                                <button onclick="handleViewItemHistory('${item.id}', '${item.name}')" title="View History" class="bg-gray-200 text-gray-800 p-2.5 rounded-lg hover:bg-gray-300">
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                </button>
+                            </div>
+                            
+                            <!-- Superuser Delete -->
+                            ${superuserDeleteBtn ? `<div class="mt-3 text-right">${superuserDeleteBtn}</div>` : ''}
+                        </div>
+                    `;
+                });
+
+                html += `</div></div>`; // Close space-y-4 and category div
+            }
+            
+            list.innerHTML = html; // Set the concatenated HTML
         }
         
         function renderUserRoles(users) {
@@ -1522,6 +1657,7 @@
                     category: category,
                     stock: stock,
                     lowStockThreshold: lowStock,
+                    isHidden: false, // NEW: Default to visible
                     addedAt: serverTimestamp(),
                     lastAddition: {
                         qty: stock,
@@ -1550,35 +1686,42 @@
             }
         }
         
-        async function handleEditItemName(itemId, oldName) {
-            // Re-purpose this to open a modal
+        // --- NEW HELPER FUNCTIONS FOR INVENTORY MGT ---
+
+        function handleOpenEditModal(itemId) {
             const item = inventoryCache.find(i => i.id === itemId);
             if (!item) return;
             
             // Pre-fill modal
-            document.getElementById('modal-edit-item-name').value = item.name;
-            document.getElementById('modal-edit-item-code').value = item.itemCode;
-            document.getElementById('modal-edit-item-category').value = item.category;
+            document.getElementById('item-details-title').textContent = `Edit: ${item.name}`;
+            document.getElementById('modal-detail-item-name').value = item.name;
+            document.getElementById('modal-detail-item-code').value = item.itemCode;
+            document.getElementById('modal-detail-item-category').value = item.category;
+            document.getElementById('modal-detail-item-threshold').value = item.lowStockThreshold;
+            document.getElementById('modal-detail-item-hidden').checked = item.isHidden || false;
             
-            const confirmBtn = document.getElementById('modal-edit-confirm-btn');
+            const confirmBtn = document.getElementById('modal-detail-confirm-btn');
+            // Clone and replace button to remove old event listeners
             const newConfirmBtn = confirmBtn.cloneNode(true);
             confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
             
-            newConfirmBtn.onclick = () => handleConfirmEditItem(itemId, oldName);
+            newConfirmBtn.onclick = () => handleConfirmEditItemDetails(itemId);
             
-            document.getElementById('edit-item-modal').classList.remove('hidden');
+            document.getElementById('item-details-modal').classList.remove('hidden');
         }
         
-        function closeEditItemModal() {
-            document.getElementById('edit-item-modal').classList.add('hidden');
+        function closeEditItemDetailsModal() {
+            document.getElementById('item-details-modal').classList.add('hidden');
         }
         
-        async function handleConfirmEditItem(itemId, oldName) {
-            const newName = document.getElementById('modal-edit-item-name').value.trim();
-            const newItemCode = document.getElementById('modal-edit-item-code').value.trim();
-            const newCategory = document.getElementById('modal-edit-item-category').value.trim();
+        async function handleConfirmEditItemDetails(itemId) {
+            const newName = document.getElementById('modal-detail-item-name').value.trim();
+            const newItemCode = document.getElementById('modal-detail-item-code').value.trim();
+            const newCategory = document.getElementById('modal-detail-item-category').value.trim();
+            const newThreshold = parseInt(document.getElementById('modal-detail-item-threshold').value, 10);
+            const isHidden = document.getElementById('modal-detail-item-hidden').checked;
             
-            if (!newName || !newItemCode || !newCategory) {
+            if (!newName || !newItemCode || !newCategory || isNaN(newThreshold)) {
                 showToast("All fields are required.", true);
                 return;
             }
@@ -1591,43 +1734,125 @@
             }
             
             const itemRef = doc(getInventoryCollection(), itemId);
+            const oldItem = inventoryCache.find(i => i.id === itemId);
+            
             try {
-                await updateDoc(itemRef, { 
+                const updateData = { 
                     name: newName,
                     itemCode: newItemCode,
-                    category: newCategory
-                });
+                    category: newCategory,
+                    lowStockThreshold: newThreshold,
+                    isHidden: isHidden
+                };
+                
+                await updateDoc(itemRef, updateData);
                 await logActivity("Inventory Item Details Updated", { 
                     itemId: itemId, 
-                    oldName: oldName, 
-                    newName: newName,
-                    newItemCode: newItemCode,
-                    newCategory: newCategory
+                    oldDetails: {
+                        name: oldItem.name,
+                        itemCode: oldItem.itemCode,
+                        category: oldItem.category,
+                        threshold: oldItem.lowStockThreshold,
+                        hidden: oldItem.isHidden
+                    },
+                    newDetails: updateData
                 });
                 showToast("Item details updated.");
-                closeEditItemModal();
+                closeEditItemDetailsModal();
             } catch (error) {
                 console.error("Update item details error: ", error);
                 showToast("Failed to update item details.", true);
             }
         }
         
-        async function handleUpdateItemThreshold(itemId) {
-            const lowStock = parseInt(document.getElementById(`lowstock-${itemId}`).value, 10);
-            if (isNaN(lowStock) || lowStock < 0) {
-                showToast("Please enter a valid low stock threshold.", true);
+        async function handleQuickAddStock(itemId, currentStock) {
+            const qtyInput = document.getElementById(`add-stock-qty-${itemId}`);
+            if (!qtyInput) return;
+            
+            const qtyToAdd = parseInt(qtyInput.value, 10);
+            
+            if (isNaN(qtyToAdd) || qtyToAdd <= 0) {
+                showToast("Please enter a valid quantity to add.", true);
                 return;
             }
             
+            const newStock = currentStock + qtyToAdd;
             const itemRef = doc(getInventoryCollection(), itemId);
+            
             try {
-                await updateDoc(itemRef, { lowStockThreshold: lowStock });
-                await logActivity("Inventory Threshold Updated", { itemId: itemId, newThreshold: lowStock });
-                showToast("Low stock threshold updated.");
+                await updateDoc(itemRef, {
+                    stock: newStock,
+                    lastAddition: {
+                        qty: qtyToAdd,
+                        date: serverTimestamp(),
+                        user: currentUserProfile.name
+                    }
+                });
+                await logActivity("Stock Added", { itemId: itemId, added: qtyToAdd, newStock: newStock });
+                showToast("Stock added successfully.");
+                qtyInput.value = ''; // Clear input
             } catch (error) {
-                console.error("Update threshold error: ", error);
-                showToast("Failed to update threshold.", true);
+                console.error("Add stock error: ", error);
+                showToast("Failed to add stock.", true);
             }
+        }
+        
+        async function handleToggleCategory(categoryName, shouldHide) {
+            const action = shouldHide ? "Hide" : "Show";
+            showConfirmationModal(
+                `${action} Category?`,
+                `This will ${action.toLowerCase()} all items in the "${categoryName}" category from the public inventory.`,
+                async () => {
+                    const batch = writeBatch(db);
+                    const itemsToUpdate = inventoryCache.filter(item => item.category === categoryName);
+                    
+                    if (itemsToUpdate.length === 0) {
+                        showToast("No items found for this category.", true);
+                        return;
+                    }
+                    
+                    itemsToUpdate.forEach(item => {
+                        const itemRef = doc(getInventoryCollection(), item.id);
+                        batch.update(itemRef, { isHidden: shouldHide });
+                    });
+                    
+                    try {
+                        await batch.commit();
+                        await logActivity("Category Toggled", { category: categoryName, action: action });
+                        showToast(`Category "${categoryName}" is now ${shouldHide ? 'hidden' : 'visible'}.`);
+                    } catch (error) {
+                        console.error("Category toggle error:", error);
+                        showToast("Failed to update category.", true);
+                    }
+                }
+            );
+        }
+
+        // --- END OF NEW HELPERS ---
+        
+        // This function is now DEPRECATED by the new modal
+        function handleEditItemName(itemId, oldName) {
+            // Re-purpose this to open the *new* modal
+            handleOpenEditModal(itemId);
+        }
+        
+        // This function is now DEPRECATED
+        function closeEditItemModal() {
+            // This modal doesn't exist anymore, but we leave the function
+            // just in case, or point it to the new one.
+            closeEditItemDetailsModal();
+        }
+        
+        // This function is now DEPRECATED
+        async function handleConfirmEditItem(itemId, oldName) {
+            // This is handled by handleConfirmEditItemDetails
+            console.warn("handleConfirmEditItem is deprecated.");
+        }
+        
+        // This function is now DEPRECATED
+        async function handleUpdateItemThreshold(itemId) {
+            // This is handled by handleConfirmEditItemDetails
+            console.warn("handleUpdateItemThreshold is deprecated.");
         }
         
         function handleOpenAddStockModal(itemId, itemName, currentStock) {
@@ -1711,7 +1936,7 @@
                     } else if (log.action === 'Item Withdrawn') { // --- BUGFIX: Use new log type ---
                         detailsText = `-${log.details.quantity} (New Stock: ${log.details.newStock}) | Req: ${log.details.requestId.substring(0, 5)}...`;
                     } else if (log.action === 'Inventory Item Details Updated') {
-                        detailsText = `Details updated (Code: ${log.details.newItemCode})`;
+                        detailsText = `Details updated (Code: ${log.details.newDetails.itemCode})`;
                     } else if (log.action === 'Inventory Item Added') {
                         detailsText = `Item created (Code: ${log.details.itemCode})`;
                     }
@@ -1907,6 +2132,7 @@
                     category: item.itemCategory,
                     stock: 0, // Default stock to 0
                     lowStockThreshold: 5, // Default
+                    isHidden: false, // Default to visible
                     addedAt: serverTimestamp(),
                     lastAddition: { qty: 0, date: null, user: null },
                     lastWithdrawal: { qty: 0, date: null, user: null }
@@ -1988,24 +2214,50 @@
             document.getElementById('toggle-to-register').addEventListener('click', (e) => { e.preventDefault(); toggleAuthForms(true); });
             document.getElementById('toggle-to-login').addEventListener('click', (e) => { e.preventDefault(); toggleAuthForms(false); });
             
+            // --- NEW: Filter Listeners ---
+            // Use 'input' for live search
+            // --- FIX: Add guards to prevent errors if elements don't exist ---
+            const userCategoryFilter = document.getElementById('user-category-filter');
+            if (userCategoryFilter) {
+                userCategoryFilter.addEventListener('input', () => renderUserInventory(inventoryCache));
+            }
+            
+            const userSearchFilter = document.getElementById('user-search-filter');
+            if (userSearchFilter) {
+                userSearchFilter.addEventListener('input', () => renderUserInventory(inventoryCache));
+            }
+            
+            const managerCategoryFilter = document.getElementById('manager-category-filter');
+            if (managerCategoryFilter) {
+                managerCategoryFilter.addEventListener('input', () => renderManagerInventory(inventoryCache));
+            }
+            
+            const managerSearchFilter = document.getElementById('manager-search-filter');
+            if (managerSearchFilter) {
+                managerSearchFilter.addEventListener('input', () => renderManagerInventory(inventoryCache));
+            }
+            
             // Modal Listeners
             document.getElementById('modal-cancel-btn').addEventListener('click', closeConfirmationModal);
             document.getElementById('modal-stock-cancel-btn').addEventListener('click', closeAddStockModal);
-            document.getElementById('modal-edit-cancel-btn').addEventListener('click', closeEditItemModal);
+            // document.getElementById('modal-edit-cancel-btn').addEventListener('click', closeEditItemModal); // DEPRECATED
             document.getElementById('item-history-close-btn').addEventListener('click', closeItemHistoryModal);
+            
+            // --- NEW LISTENER ---
+            document.getElementById('modal-detail-cancel-btn').addEventListener('click', closeEditItemDetailsModal);
         }
 
         // --- 8. GLOBAL EXPORTS & INITIALIZATION ---
         window.handleAddToRequest = handleAddToRequest;
         window.handleUpdateRequestQuantity = handleUpdateRequestQuantity;
         window.handleRemoveFromRequest = handleRemoveFromRequest;
-        window.handleUpdateItemThreshold = handleUpdateItemThreshold;
+        // window.handleUpdateItemThreshold = handleUpdateItemThreshold; // DEPRECATED
         window.handleUpdateUserRole = handleUpdateUserRole;
         window.handleApproveUser = handleApproveUser;
         window.handleSuspendUser = handleSuspendUser;
         window.handleDeleteUser = handleDeleteUser;
         window.handleOpenAddStockModal = handleOpenAddStockModal;
-        window.handleEditItemName = handleEditItemName;
+        window.handleEditItemName = handleEditItemName; // Still used to open the modal
         window.handleViewItemHistory = handleViewItemHistory;
         window.handleDeleteLog = handleDeleteLog;
         window.handleDeleteRequest = handleDeleteRequest;
@@ -2013,6 +2265,11 @@
         window.handleLogout = handleLogout;
         window.showUserPage = showUserPage;
         window.showManagerTab = showManagerTab;
+        
+        // --- NEW EXPORTS ---
+        window.handleOpenEditModal = handleOpenEditModal;
+        window.handleQuickAddStock = handleQuickAddStock;
+        window.handleToggleCategory = handleToggleCategory;
 
         document.addEventListener('DOMContentLoaded', () => {
             initializeFirebase();
@@ -2235,6 +2492,21 @@
             <!-- User Page: Inventory -->
             <div id="user-inventory-page">
                 <h2 class="text-3xl font-bold mb-4 text-red-800 border-b-2 border-red-200 pb-2">Products</h2>
+                
+                <!-- NEW: User-side filters -->
+                <div class="flex flex-col md:flex-row gap-4 mb-4 p-4 bg-white rounded-lg border">
+                    <div class="flex-1">
+                        <label for="user-category-filter" class="block text-sm font-medium text-gray-700">Filter by Category</label>
+                        <select id="user-category-filter" class="mt-1 block w-full rounded-lg border-gray-300">
+                            <!-- Options will be added by JS -->
+                        </select>
+                    </div>
+                    <div class="flex-1">
+                        <label for="user-search-filter" class="block text-sm font-medium text-gray-700">Search by Name/Code</label>
+                        <input type="text" id="user-search-filter" placeholder="Type to search..." class="mt-1 block w-full rounded-lg border-gray-300">
+                    </div>
+                </div>
+                
                 <div id="user-inventory-list" class="space-y-4"></div>
             </div>
 
@@ -2369,6 +2641,22 @@
                 
                 <div class="bg-white p-4 md:p-6 rounded-lg border">
                     <h3 class="text-xl font-semibold mb-4 text-gray-800 border-b pb-2">Manage Stock</h3>
+                    
+                    <!-- NEW: Manager-side filters -->
+                    <div class="flex flex-col md:flex-row gap-4 mb-4">
+                        <div class="flex-1">
+                            <label for="manager-category-filter" class="block text-sm font-medium text-gray-700">Filter by Category</label>
+                            <select id="manager-category-filter" class="mt-1 block w-full rounded-lg border-gray-300">
+                                <!-- Options will be added by JS -->
+                            </select>
+                        </div>
+                        <div class="flex-1">
+                            <label for="manager-search-filter" class="block text-sm font-medium text-gray-700">Search by Name/Code</label>
+                            <input type="text" id="manager-search-filter" placeholder="Type to search..." class="mt-1 block w-full rounded-lg border-gray-300">
+                        </div>
+                    </div>
+                    
+                    <!-- NEW RENDERED LIST -->
                     <div id="manager-inventory-list" class="space-y-4"></div>
                 </div>
             </div>
@@ -2463,7 +2751,7 @@
         </div>
     </div>
     
-    <!-- Add Stock Modal -->
+    <!-- Add Stock Modal (Legacy, but kept for Dashboard quick-add) -->
     <div id="add-stock-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop">
         <div class="bg-white rounded-lg border p-6 max-w-sm w-full">
             <h2 class="text-xl font-bold text-gray-900 mb-4">Add Stock</h2>
@@ -2499,7 +2787,7 @@
         </div>
     </div>
     
-    <!-- NEW Edit Item Modal -->
+    <!-- DEPRECATED Edit Item Modal (No longer used, replaced by item-details-modal) -->
     <div id="edit-item-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop">
         <div class="bg-white rounded-lg border p-6 max-w-lg w-full">
             <h2 class="text-xl font-bold text-gray-900 mb-4">Edit Item Details</h2>
@@ -2522,6 +2810,44 @@
                     Cancel
                 </button>
                 <button id="modal-edit-confirm-btn" class="bg-red-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-red-700">
+                    Save Changes
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- NEW Edit Item Details Modal (Replaces the one above) -->
+    <div id="item-details-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop">
+        <div class="bg-white rounded-lg border p-6 max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <h2 id="item-details-title" class="text-xl font-bold text-gray-900 mb-4">Edit Item</h2>
+            <div class="space-y-4">
+                <div>
+                    <label for="modal-detail-item-name" class="block text-sm font-medium text-gray-700">Item Name/Description</label>
+                    <input type="text" id="modal-detail-item-name" class="mt-1 block w-full rounded-lg border-gray-300 sm:text-sm">
+                </div>
+                 <div>
+                    <label for="modal-detail-item-code" class="block text-sm font-medium text-gray-700">Item Code</label>
+                    <input type="text" id="modal-detail-item-code" class="mt-1 block w-full rounded-lg border-gray-300 sm:text-sm">
+                </div>
+                 <div>
+                    <label for="modal-detail-item-category" class="block text-sm font-medium text-gray-700">Category</label>
+                    <input type="text" id="modal-detail-item-category" class="mt-1 block w-full rounded-lg border-gray-300 sm:text-sm">
+                </div>
+                <div>
+                    <label for="modal-detail-item-threshold" class="block text-sm font-medium text-gray-700">Low Stock Threshold</label>
+                    <input type="number" id="modal-detail-item-threshold" class="mt-1 block w-full rounded-lg border-gray-300 sm:text-sm">
+                </div>
+                <hr>
+                <div class="flex items-center">
+                    <input type="checkbox" id="modal-detail-item-hidden" class="h-4 w-4 text-red-600 border-gray-300 rounded focus:ring-red-500">
+                    <label for="modal-detail-item-hidden" class="ml-2 block text-sm font-medium text-gray-700">Hide from Public Inventory</label>
+                </div>
+            </div>
+            <div class="flex justify-end gap-3 mt-6">
+                <button id="modal-detail-cancel-btn" class="bg-gray-200 text-gray-800 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300">
+                    Cancel
+                </button>
+                <button id="modal-detail-confirm-btn" class="bg-red-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-red-700">
                     Save Changes
                 </button>
             </div>
