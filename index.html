@@ -169,7 +169,7 @@
                 // 4. Active user, or manager/superuser? Let them in.
                 if (currentUserProfile.status === 'active' || currentUserRole === 'manager' || currentUserRole === 'superuser') {
                     showView('app-container');
-                    document.getElementById('user-id-display').textContent = `User: ${currentUserProfile.name} (${currentUserEmail})`;
+                    document.getElementById('user-id-display').textContent = `User: ${currentUserProfile.name} (Emp ID: ${currentUserProfile.empId})`;
                     document.getElementById('user-role-display').textContent = `Role: ${currentUserRole}`;
                     setupUIForRole(currentUserRole);
                     attachDataListeners(currentUserRole, userId);
@@ -182,6 +182,10 @@
                 
             } else {
                 // New user: Create a default 'user' role, force profile setup, and set status to 'pending'
+                
+                // --- NEW: Extract Employee ID from the dummy email ---
+                const emailEmpId = user.email.split('@')[0].split('-')[1] || null;
+
                 currentUserRole = 'user';
                 await setDoc(userRoleRef, { 
                     role: 'user', 
@@ -190,10 +194,10 @@
                     userId: userId,
                     email: user.email,
                     name: "", 
-                    empId: "",
+                    empId: emailEmpId, // --- NEW: Save the Employee ID
                     designation: ""
                 });
-                await logActivity("User Registered", { email: user.email });
+                await logActivity("User Registered", { email: user.email, empId: emailEmpId });
                 // Recurse to trigger profile setup
                 await checkUserRoleAndProfile(user);
             }
@@ -201,7 +205,7 @@
 
         async function handleProfileUpdate(isFirstTime) {
             const name = document.getElementById('profile-name').value.trim();
-            const empId = document.getElementById('profile-empId').value.trim();
+            const empId = document.getElementById('profile-empId').value.trim(); // This is read-only, but we get it
             const designation = document.getElementById('profile-designation').value.trim();
             
             if (!name || !empId || !designation) {
@@ -237,12 +241,22 @@
         }
         
         async function handleRegister() {
-            const email = document.getElementById('register-email').value;
-            const password = document.getElementById('register-password').value;
-            if (!email || !password) {
-                showAuthError("Please enter both email and password.");
+            const empId = document.getElementById('register-empid').value.trim();
+            const pin = document.getElementById('register-pin').value.trim();
+            
+            if (!empId || !pin) {
+                showAuthError("Please enter both Employee ID and PIN.");
                 return;
             }
+            if (!/^\d{4}$/.test(pin)) {
+                showAuthError("PIN must be exactly 4 digits.");
+                return;
+            }
+
+            // --- NEW: Convert to Email/Password ---
+            const email = `user-${empId}@hubli-store.app`;
+            const password = `PIN-${pin}`; // Add prefix to meet 6-char requirement
+            
             try {
                 showAuthLoading(true);
                 await createUserWithEmailAndPassword(auth, email, password);
@@ -256,12 +270,18 @@
         }
 
         async function handleLogin() {
-            const email = document.getElementById('login-email').value;
-            const password = document.getElementById('login-password').value;
-            if (!email || !password) {
-                showAuthError("Please enter both email and password.");
+            const empId = document.getElementById('login-empid').value.trim();
+            const pin = document.getElementById('login-pin').value.trim();
+            
+            if (!empId || !pin) {
+                showAuthError("Please enter both Employee ID and PIN.");
                 return;
             }
+            
+            // --- NEW: Convert to Email/Password ---
+            const email = `user-${empId}@hubli-store.app`;
+            const password = `PIN-${pin}`; // Add prefix to match registration
+
             try {
                 showAuthLoading(true);
                 await signInWithEmailAndPassword(auth, email, password);
@@ -280,12 +300,12 @@
         
         function getFriendlyAuthError(error) {
             switch (error.code) {
-                case 'auth/invalid-email': return 'Please enter a valid email address.';
+                case 'auth/invalid-email': return 'Please enter a valid Employee ID.';
                 case 'auth/user-not-found':
                 case 'auth/wrong-password':
-                case 'auth/invalid-credential': return 'Invalid email or password.';
-                case 'auth/email-already-in-use': return 'This email is already registered. Please log in.';
-                case 'auth/weak-password': return 'Password should be at least 6 characters.';
+                case 'auth/invalid-credential': return 'Invalid Employee ID or PIN.';
+                case 'auth/email-already-in-use': return 'This Employee ID is already registered.';
+                case 'auth/weak-password': return 'PIN must be at least 4 digits.'; // Should be caught by form validation
                 default: return 'An error occurred. Please try again.';
             }
         }
@@ -576,99 +596,72 @@
                 return;
             }
             
-            // Build the items array with new detailed info
-            const itemsWithDetails = [];
-            let formIsValid = true;
-            for (const item of localCartCache) {
-                const type = document.querySelector(`input[name="type-${item.id}"]:checked`)?.value;
-                let individualInfo = null;
-                
-                if (type === 'individual') {
-                    const forWho = document.querySelector(`input[name="for-${item.id}"]:checked`)?.value;
-                    if (forWho === 'self') {
-                        individualInfo = {
-                            name: currentUserProfile.name,
-                            empId: currentUserProfile.empId,
-                            designation: currentUserProfile.designation
-                        };
-                    } else if (forWho === 'other') {
-                        const name = document.getElementById(`name-${item.id}`).value.trim();
-                        const empId = document.getElementById(`empId-${item.id}`).value.trim();
-                        const designation = document.getElementById(`desg-${item.id}`).value.trim();
-                        
-                        if (!name || !designation) {
-                            formIsValid = false;
-                            showToast(`Please fill in all details for "${item.productName}".`, true);
-                            break;
-                        }
-                        individualInfo = { name, empId, designation };
-                    }
-                }
-                
-                if (!type) {
-                    formIsValid = false;
-                    showToast(`Please select a type for "${item.productName}".`, true);
-                    break;
-                }
-
-                itemsWithDetails.push({
-                    ...item,
-                    type: type,
-                    individualInfo: individualInfo,
-                    remarks: document.getElementById(`remarks-${item.id}`).value.trim()
-                });
-            }
-            
-            if (!formIsValid) {
-                checkoutButton.disabled = false;
-                checkoutButton.textContent = "Confirm Order";
-                return;
-            }
-
-            if (itemsWithDetails.length === 0) {
-                showToast("Your cart is empty.", true);
-                checkoutButton.disabled = false;
-                checkoutButton.textContent = "Confirm Order";
-                return;
-            }
-
-            // This object will be saved to Firestore
-            const newOrder = {
-                userId: currentUserId,
-                userProfile: currentUserProfile,
-                status: "pending",
-                createdAt: serverTimestamp(),
-                supervisorName: supervisorName,
-                items: itemsWithDetails
-            };
+            let newOrderData;
+            let orderId;
 
             try {
-                // --- TRANSACTION FIX ---
+                // --- ATOMIC TRANSACTION ---
                 await runTransaction(db, async (transaction) => {
-                    // 1. Read Phase: Get all item documents first
+                    // --- 1. READ PHASE ---
+                    
+                    // 1a. Read all cart items
+                    const cartSnapshot = await getDocs(query(getUserCartCollection(currentUserId)));
+                    const cartItems = cartSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    
+                    if (cartItems.length === 0) {
+                        throw new Error("Your cart is empty. Please add items before checking out.");
+                    }
+
+                    // 1b. Read all inventory items in the cart
                     const inventoryDocs = new Map();
-                    const readPromises = itemsWithDetails.map(item => {
+                    const readPromises = cartItems.map(item => {
                         const itemRef = doc(getInventoryCollection(), item.productId);
                         return transaction.get(itemRef).then(doc => inventoryDocs.set(item.productId, doc));
                     });
                     await Promise.all(readPromises);
 
-                    // 2. Validation Phase: Check stock for all items
-                    for (const item of itemsWithDetails) {
+                    // --- 2. VALIDATION PHASE (In-Memory) ---
+                    const itemsWithDetails = [];
+                    for (const item of cartItems) {
                         const inventoryDoc = inventoryDocs.get(item.productId);
                         if (!inventoryDoc || !inventoryDoc.exists()) {
-                            throw new Error(`Item "${item.productName}" not found.`);
+                            throw new Error(`Item "${item.productName}" is no longer available.`);
                         }
-                        const data = inventoryDoc.data();
-                        if (data.stock < item.quantity) {
-                            throw new Error(`Not enough stock for "${item.productName}". Only ${data.stock} left.`);
+                        
+                        const inventoryData = inventoryDoc.data();
+                        if (inventoryData.stock < item.quantity) {
+                            throw new Error(`Not enough stock for "${inventoryData.name}". Only ${inventoryData.stock} left.`);
                         }
+                        
+                        // Get remarks from the (non-transacted) DOM
+                        itemsWithDetails.push({
+                            ...item,
+                            // Get simplified data
+                            remarks: document.getElementById(`remarks-${item.id}`).value.trim()
+                        });
                     }
 
-                    // 3. Write Phase: All checks passed, update all documents
+                    // --- 3. WRITE PHASE (All writes at the end) ---
+                    
+                    // 3a. Prepare the new order
+                    const newOrderRef = doc(getOrdersCollection()); // Auto-generate ID
+                    orderId = newOrderRef.id; // Store ID for logging
+                    newOrderData = {
+                        userId: currentUserId,
+                        userProfile: currentUserProfile,
+                        status: "pending",
+                        createdAt: serverTimestamp(),
+                        supervisorName: supervisorName,
+                        items: itemsWithDetails // Simplified items
+                    };
+                    
+                    // 3b. Write 1: Create the new order
+                    transaction.set(newOrderRef, newOrderData);
+
                     const withdrawalTime = serverTimestamp();
                     const withdrawalUser = currentUserProfile.name;
-                    
+
+                    // 3c. Write 2: Update all inventory items
                     for (const item of itemsWithDetails) {
                         const itemRef = doc(getInventoryCollection(), item.productId);
                         const currentStock = inventoryDocs.get(item.productId).data().stock;
@@ -683,26 +676,19 @@
                             }
                         });
                     }
+                    
+                    // 3d. Write 3: Delete all cart items
+                    for (const cartDoc of cartSnapshot.docs) {
+                        transaction.delete(cartDoc.ref);
+                    }
                 });
                 // --- TRANSACTION END ---
 
-                // Transaction succeeded, now create the order
-                const orderRef = await addDoc(getOrdersCollection(), newOrder);
-                
-                // Log activity
-                await logActivity("Order Placed", { orderId: orderRef.id, items: itemsWithDetails.length });
-
-                // Clear the user's cart
-                const batch = writeBatch(db);
-                localCartCache.forEach(item => {
-                    const cartItemRef = doc(getUserCartCollection(currentUserId), item.id);
-                    batch.delete(cartItemRef);
-                });
-                await batch.commit();
-
-                // Success
+                // --- POST-TRANSACTION SUCCESS ---
+                await logActivity("Order Placed", { orderId: orderId, items: newOrderData.items.length });
                 showToast("Order submitted successfully!");
-                lastOrderCache = { id: orderRef.id, ...newOrder }; // Save for summary page
+                
+                lastOrderCache = { id: orderId, ...newOrderData }; // Save for summary page
                 renderOrderSummaryPage(lastOrderCache, true); // true = just created
                 showUserPage('order-summary-page');
                 
@@ -740,10 +726,6 @@
                 const currentName = currentItem ? currentItem.name : item.productName;
                 
                 summaryText += `${index + 1}. ${currentName} (Qty: ${item.quantity})\n`;
-                summaryText += `   Type: ${item.type}\n`;
-                if (item.individualInfo) {
-                    summaryText += `   For: ${item.individualInfo.name} (${item.individualInfo.designation})\n`;
-                }
                 if (item.remarks) {
                     summaryText += `   Remarks: ${item.remarks}\n`;
                 }
@@ -788,23 +770,23 @@
                     
                     <div class="space-y-4">
                         <div>
-                            <label class="block text-sm font-medium text-gray-700">Email Address</label>
+                            <label class="block text-sm font-medium text-gray-700">Login Email (Auto-generated)</label>
                             <input type="email" value="${email}" disabled class="mt-1 block w-full rounded-lg border-gray-300 bg-gray-100 shadow-sm sm:text-sm">
+                        </div>
+                        <div>
+                            <label for="profile-empId" class="block text-sm font-medium text-gray-700">Employee ID</label>
+                            <input type="text" id="profile-empId" value="${empId}" disabled class="mt-1 block w-full rounded-lg border-gray-300 bg-gray-100 shadow-sm sm:text-sm">
                         </div>
                         <div>
                             <label for="profile-name" class="block text-sm font-medium text-gray-700">Full Name</label>
                             <input type="text" id="profile-name" value="${name}" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm">
                         </div>
                         <div>
-                            <label for="profile-empId" class="block text-sm font-medium text-gray-700">Employee ID</label>
-                            <input type="text" id="profile-empId" value="${empId}" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm">
-                        </div>
-                        <div>
                             <label for="profile-designation" class="block text-sm font-medium text-gray-700">Designation</label>
                             <input type="text" id="profile-designation" value="${designation}" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300 sm:text-sm">
                         </div>
                         
-                        <button id="update-profile-btn" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 transition-all duration-200 shadow-md">
+                        <button id="update-profile-btn" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 shadow-md">
                             ${buttonText}
                         </button>
                     </div>
@@ -826,7 +808,7 @@
             inventory.forEach(item => {
                 const inStock = item.stock > 0;
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-lg flex justify-between items-center transition-all duration-300 hover:shadow-xl">
+                    <div class="bg-white p-4 rounded-xl shadow-lg flex justify-between items-center">
                         <div>
                             <h3 class="text-lg font-semibold text-gray-800">${item.name}</h3>
                             <p class="text-gray-600">
@@ -835,7 +817,7 @@
                         </div>
                         <button 
                             onclick="handleAddToCart('${item.id}', '${item.name}', ${item.stock})" 
-                            class="add-to-cart-btn ${inStock ? 'bg-blue-500 hover:bg-blue-600' : 'bg-gray-300 cursor-not-allowed'} text-white font-bold py-2 px-4 rounded-lg transition-all duration-200 shadow-md hover:shadow-lg transform hover:-translate-y-0.5"
+                            class="add-to-cart-btn ${inStock ? 'bg-blue-500 hover:bg-blue-600' : 'bg-gray-300 cursor-not-allowed'} text-white font-bold py-2 px-4 rounded-lg shadow-md hover:shadow-lg"
                             ${!inStock ? 'disabled' : ''}
                         >
                             Add to Cart
@@ -871,12 +853,12 @@
                             <div>
                                 <h4 class="font-semibold text-gray-800">${currentName}</h4>
                                 <div class="flex items-center gap-2 mt-2">
-                                    <button onclick="handleUpdateCartQuantity('${item.id}', ${item.quantity - 1})" class="bg-gray-200 w-7 h-7 rounded-full font-bold text-lg text-gray-700 flex items-center justify-center transition-all hover:bg-gray-300">-</button>
+                                    <button onclick="handleUpdateCartQuantity('${item.id}', ${item.quantity - 1})" class="bg-gray-200 w-7 h-7 rounded-full font-bold text-lg text-gray-700 flex items-center justify-center hover:bg-gray-300">-</button>
                                     <span class="text-lg w-8 text-center">${item.quantity}</span>
-                                    <button onclick="handleUpdateCartQuantity('${item.id}', ${item.quantity + 1})" class="bg-gray-200 w-7 h-7 rounded-full font-bold text-lg text-gray-700 flex items-center justify-center transition-all hover:bg-gray-300">+</button>
+                                    <button onclick="handleUpdateCartQuantity('${item.id}', ${item.quantity + 1})" class="bg-gray-200 w-7 h-7 rounded-full font-bold text-lg text-gray-700 flex items-center justify-center hover:bg-gray-300">+</button>
                                 </div>
                             </div>
-                            <button onclick="handleRemoveFromCart('${item.id}')" class="text-red-500 hover:text-red-700 font-medium transition-colors">
+                            <button onclick="handleRemoveFromCart('${item.id}')" class="text-red-500 hover:text-red-700 font-medium">
                                 Remove
                             </button>
                         </div>
@@ -906,59 +888,19 @@
                 const inventoryItem = inventoryCache.find(inv => inv.id === item.productId);
                 const currentName = inventoryItem ? inventoryItem.name : item.productName;
                 
+                // --- SIMPLIFIED CHECKOUT ---
                 list.innerHTML += `
                     <div class="bg-white p-4 rounded-xl shadow-md space-y-4" id="item-form-${item.id}">
                         <h4 class="text-lg font-semibold text-gray-800">${currentName} (Qty: ${item.quantity})</h4>
                         
                         <div>
-                            <label class="block text-sm font-medium text-gray-700">Type:</label>
-                            <div classs="mt-2 flex gap-4">
-                                <label class="flex items-center">
-                                    <input type="radio" name="type-${item.id}" value="operations" class="form-radio h-4 w-4 text-blue-600" onchange="toggleIndividualFields('${item.id}', false)">
-                                    <span class="ml-2 text-gray-700">Operations</span>
-                                </label>
-                                <label class="flex items-center ml-4">
-                                    <input type="radio" name="type-${item.id}" value="individual" class="form-radio h-4 w-4 text-blue-600" onchange="toggleIndividualFields('${item.id}', true)">
-                                    <span class="ml-2 text-gray-700">Individual</span>
-                                </label>
-                            </div>
-                        </div>
-                        
-                        <div id="individual-fields-${item.id}" class="hidden space-y-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
-                            <label class="block text-sm font-medium text-gray-700">For:</label>
-                            <div class="flex gap-4">
-                                <label class="flex items-center">
-                                    <input type="radio" name="for-${item.id}" value="self" checked class="form-radio h-4 w-4 text-blue-600" onchange="toggleIndividualNameFields('${item.id}', false)">
-                                    <span class="ml-2 text-gray-700">Self (auto-fill)</span>
-                                </label>
-                                <label class="flex items-center ml-4">
-                                    <input type="radio" name="for-${item.id}" value="other" class="form-radio h-4 w-4 text-blue-600" onchange="toggleIndividualNameFields('${item.id}', true)">
-                                    <span class="ml-2 text-gray-700">Other Person</span>
-                                </label>
-                            </div>
-                            
-                            <div id="other-person-fields-${item.id}" class="hidden space-y-3">
-                                <input type="text" id="name-${item.id}" placeholder="Full Name" class="block w-full rounded-lg border-gray-300 sm:text-sm">
-                                <input type="text" id="desg-${item.id}" placeholder="Designation" class="block w-full rounded-lg border-gray-300 sm:text-sm">
-                                <input type="text" id="empId-${item.id}" placeholder="Employee ID (Optional)" class="block w-full rounded-lg border-gray-300 sm:text-sm">
-                            </div>
-                        </div>
-                        
-                        <div>
-                            <label for="remarks-${item.id}" class="block text-sm font-medium text-gray-700">Other Remarks:</label>
+                            <label for="remarks-${item.id}" class="block text-sm font-medium text-gray-700">Remarks:</label>
                             <input type="text" id="remarks-${item.id}" class="checkout-remarks-input mt-1 block w-full rounded-lg border-gray-300 sm:text-sm" placeholder="Optional">
                         </div>
                     </div>
                 `;
             });
         }
-        
-        window.toggleIndividualFields = (itemId, show) => {
-            document.getElementById(`individual-fields-${itemId}`).classList.toggle('hidden', !show);
-        };
-        window.toggleIndividualNameFields = (itemId, show) => {
-            document.getElementById(`other-person-fields-${itemId}`).classList.toggle('hidden', !show);
-        };
         
         function renderOrderSummaryPage(order, justCreated) {
             const list = document.getElementById('order-summary-details');
@@ -975,17 +917,10 @@
                 const currentItem = inventoryCache.find(inv => inv.id === item.productId);
                 const currentName = currentItem ? currentItem.name : item.productName;
                 
+                // --- SIMPLIFIED SUMMARY ---
                 itemsHtml += `
                     <div class="p-4 border border-gray-200 rounded-lg">
                         <h5 class="font-semibold text-gray-800">${index + 1}. ${currentName} (Qty: ${item.quantity})</h5>
-                        <p class="text-sm text-gray-600 capitalize">Type: ${item.type}</p>
-                        ${item.individualInfo ? `
-                            <div class="pl-4 mt-2 text-sm">
-                                <p>For: ${item.individualInfo.name}</p>
-                                <p>${item.individualInfo.designation}</p>
-                                ${item.individualInfo.empId ? `<p>ID: ${item.individualInfo.empId}</p>` : ''}
-                            </div>
-                        ` : ''}
                         ${item.remarks ? `<p class="text-sm text-gray-600 mt-2">Remarks: ${item.remarks}</p>` : ''}
                     </div>
                 `;
@@ -1035,7 +970,7 @@
                 const orderDate = order.createdAt?.toDate ? order.createdAt.toDate().toLocaleDateString() : 'Pending';
                 
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-lg transition-all duration-300 hover:shadow-xl">
+                    <div class="bg-white p-4 rounded-xl shadow-lg">
                         <div class="flex justify-between items-center">
                             <div>
                                 <h3 class="text-lg font-semibold text-gray-800">Order ID: <span class="font-normal text-sm">${order.id}</span></h3>
@@ -1172,7 +1107,7 @@
                 let superuserButtons = '';
                 if (currentUserRole === 'superuser') {
                     superuserButtons = `
-                        <button onclick="handleDeleteItem('${item.id}', '${item.name}')" class="w-full bg-red-600 text-white py-2 px-4 rounded-lg hover:bg-red-700 font-semibold shadow-md transition-all">
+                        <button onclick="handleDeleteItem('${item.id}', '${item.name}')" class="w-full bg-red-600 text-white py-2 px-4 rounded-lg hover:bg-red-700 font-semibold shadow-md">
                             DELETE ITEM
                         </button>
                     `;
@@ -1205,15 +1140,15 @@
                                 <label for="lowstock-${item.id}" class="text-xs font-medium text-gray-600">Low Stock At</label>
                                 <input type="number" id="lowstock-${item.id}" value="${item.lowStockThreshold}" class="mt-1 w-full p-2 border border-gray-300 rounded-lg">
                             </div>
-                            <button onclick="handleUpdateItemThreshold('${item.id}')" class="md:mt-6 bg-gray-600 text-white py-2 px-4 rounded-lg hover:bg-gray-700 font-semibold shadow-md transition-all">
+                            <button onclick="handleUpdateItemThreshold('${item.id}')" class="md:mt-6 bg-gray-600 text-white py-2 px-4 rounded-lg hover:bg-gray-700 font-semibold shadow-md">
                                 Save Threshold
                             </button>
-                             <button onclick="handleOpenAddStockModal('${item.id}', '${item.name}', ${item.stock})" class="md:mt-6 bg-blue-500 text-white py-2 px-4 rounded-lg hover:bg-blue-600 font-semibold shadow-md transition-all">
+                             <button onclick="handleOpenAddStockModal('${item.id}', '${item.name}', ${item.stock})" class="md:mt-6 bg-blue-500 text-white py-2 px-4 rounded-lg hover:bg-blue-600 font-semibold shadow-md">
                                 Add Stock
                             </button>
                         </div>
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                            <button onclick="handleEditItemName('${item.id}', '${item.name}')" class="bg-yellow-500 text-white py-2 px-4 rounded-lg hover:bg-yellow-600 font-semibold shadow-md transition-all">
+                            <button onclick="handleEditItemName('${item.id}', '${item.name}')" class="bg-yellow-500 text-white py-2 px-4 rounded-lg hover:bg-yellow-600 font-semibold shadow-md">
                                 Edit Name
                             </button>
                             ${superuserButtons}
@@ -1321,7 +1256,7 @@
                 }
 
                 list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl shadow-lg transition-all duration-300 hover:shadow-xl">
+                    <div class="bg-white p-4 rounded-xl shadow-lg">
                         <div class="flex justify-between items-center">
                             <div>
                                 <h3 class="text-lg font-semibold text-gray-800">${order.userProfile?.name || 'Unknown User'}</h3>
@@ -1563,7 +1498,7 @@
         async function handleDeleteUser(userId, email) {
             showConfirmationModal(
                 "Delete User Data?",
-                `This will delete all app data (profile, cart) for ${email}. It will NOT delete their login account. You must do that from the Firebase Console. This action is irreversible.`,
+                `This will delete all app data (profile, cart) for ${email}. It will NOT delete their login/PIN. You must do that from the Firebase Console. This is how you reset a user's PIN.`,
                 async () => {
                     try {
                         // 1. Delete user role doc
@@ -1581,7 +1516,7 @@
                         
                         // 3. Log it
                         await logActivity("User Data Deleted", { deletedUserId: userId, email: email });
-                        showToast("User data deleted. Remember to delete their login from the Auth console.");
+                        showToast("User data deleted. Remember to delete their login from the Auth console to reset their PIN.");
 
                     } catch (error) {
                         console.error("Delete user error:", error);
@@ -1709,11 +1644,6 @@
 
     <!-- Custom Styles -->
     <style>
-        #app-container, #login-view, #profile-setup-view, #pending-view, #suspended-view {
-            animation: fadeIn 0.5s ease-in-out;
-        }
-        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-        
         .spinner {
             border: 2px solid rgba(0, 0, 0, 0.1);
             border-left-color: #ffffff;
@@ -1757,17 +1687,17 @@
             <form id="login-form" class="p-8 bg-white rounded-xl shadow-xl space-y-4">
                 <h2 class="text-2xl font-bold text-gray-800 text-center">Login</h2>
                 <div>
-                    <label for="login-email" class="block text-sm font-medium text-gray-700">Email</label>
-                    <input type="email" id="login-email" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
+                    <label for="login-empid" class="block text-sm font-medium text-gray-700">Employee ID</label>
+                    <input type="text" id="login-empid" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
                 </div>
                 <div>
-                    <label for="login-password" class="block text-sm font-medium text-gray-700">Password</label>
-                    <input type="password" id="login-password" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
+                    <label for="login-pin" class="block text-sm font-medium text-gray-700">4-Digit PIN</label>
+                    <input type="password" id="login-pin" required maxlength="4" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
                 </div>
                 
                 <div id="auth-error-message" class="hidden text-sm text-red-600 font-medium"></div>
 
-                <button id="login-button" type="submit" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 transition-all shadow-md flex items-center justify-center gap-2">
+                <button id="login-button" type="submit" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 shadow-md flex items-center justify-center gap-2">
                     <span id="login-spinner" class="spinner hidden"></span>
                     Login
                 </button>
@@ -1781,15 +1711,15 @@
             <form id="register-form" class="hidden p-8 bg-white rounded-xl shadow-xl space-y-4">
                 <h2 class="text-2xl font-bold text-gray-800 text-center">Register</h2>
                 <div>
-                    <label for="register-email" class="block text-sm font-medium text-gray-700">Email</label>
-                    <input type="email" id="register-email" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
+                    <label for="register-empid" class="block text-sm font-medium text-gray-700">Employee ID</label>
+                    <input type="text" id="register-empid" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
                 </div>
                 <div>
-                    <label for="register-password" class="block text-sm font-medium text-gray-700">Password (min. 6 characters)</label>
-                    <input type="password" id="register-password" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
+                    <label for="register-pin" class="block text-sm font-medium text-gray-700">Create 4-Digit PIN</label>
+                    <input type="password" id="register-pin" required maxlength="4" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-300">
                 </div>
 
-                <button id="register-button" type="submit" class="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 transition-all shadow-md flex items-center justify-center gap-2">
+                <button id="register-button" type="submit" class="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 shadow-md flex items-center justify-center gap-2">
                     <span id="register-spinner" class="spinner hidden"></span>
                     Register
                 </button>
